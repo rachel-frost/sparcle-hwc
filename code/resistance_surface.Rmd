@@ -494,7 +494,8 @@ predict_ssf_surface <- function(model, covariate_stack) {
 
 lp_to_resistance <- function(lp, min_resistance = 1, max_resistance = 100, shape_parameter = 3,
                              clip = c(0.01, 0.99)) {
- 
+#mess around with shape parameter 
+
 #Takes 1st percentile and 99th percentile values of preference scores and cuts any below or above this because extreme outliers
   q <- as.numeric(quantile(values(lp, na.rm = TRUE), probs = clip))
   lp_c <- clamp(lp, lower = q[1], upper = q[2])
@@ -507,9 +508,14 @@ lp_to_resistance <- function(lp, min_resistance = 1, max_resistance = 100, shape
   # As h approaches 0 (lower selection), resistance rises toward max_resistance
   # shape_parameter controls curvature (larger = resistance drops off faster as habitat improves)
   # the (1 - exp(-c*h)) / (1 - exp(-c)) term is already scaled to 0-1, so resistance hits exactly min/max without a separate rescaling step.
-  resistance <- max_resistance -
-    (max_resistance - min_resistance) *
-    ((1 - exp(-shape_parameter * h)) / (1 - exp(-shape_parameter)))
+  #resistance <- max_resistance -
+    #(max_resistance - min_resistance) *
+    #((1 - exp(-shape_parameter * h)) / (1 - exp(-shape_parameter)))
+  
+  # Linear transformation:
+  # h = 1 (high selection) -> min_resistance
+  # h = 0 (low selection)  -> max_resistance
+  resistance <- max_resistance - (max_resistance - min_resistance) * h
   
   names(resistance) <- "resistance"
   
