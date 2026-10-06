@@ -464,13 +464,20 @@ build_covariate_stack <- function(season, year = target_year) {
 # 7. Predict linear predictor / SSF from model coefficients (REVISED)
 # -----------------------------------------------------------
 
-predict_ssf_surface <- function(model, covariate_stack) {
+predict_ssf_surface <- function(model, covariate_stack, keep = NULL ) {
  
   #fit_clogit() function wraps the model inside '$model', so extract '$model' here to get correct coefficients 
   #betas <- coef(model$model) #pulls out statistical weights calculated by SSF
   #replaced since there is no saved model
   betas <- if (!is.null(model$model)) coef(model$model) else coef(model)
   betas <- betas[!is.na(betas)]  # Remove any variables that failed to calculate (ignore NA values) 
+  
+  
+  #TAKING A SUBSET OF COVARIATES
+  # if (!is.null(keep)) betas <- betas[names(betas) %in% keep]
+ # if (length(betas) == 0) stop("None of the requested covariates are in the model.")
+ # message("Using: ", paste(names(betas), collapse = ", "))
+  
   
 #compare names of varibales in the model against the names of the map layers provided. Creates a list of any required varibales that are missing from the map. If there is something missing, triggers an error and prints what is missing
   missing_in_stack <- setdiff(names(betas), names(covariate_stack))
@@ -558,5 +565,61 @@ plot(resistance_kaza_wet, main = "KAZA Wet Season Resistance Surface")
 plot(resistance_kaza_dry, main = "KAZA Dry Season Resistance Surface")
 plet(resistance_kaza_wet, col = rev(terrain.colors(100)), tiles = "OpenStreetMap")
 plet(resistance_kaza_dry, col = rev(terrain.colors(100)), tiles = "OpenStreetMap")
+```
+```{r}
+# ------------------------------------------------------------
+#Resistance sutface - Linear Features for KAZA wet/dry 
+# ------------------------------------------------------------
+
+library(survival)
+
+# Choose ONE set of terms (names must match the columns in your extraction
+# data AND the layer names in the raster stack)
+lin_terms <- c("hydrorivers_linear", "kaza_vet_fences_linear", "roads_linear")
+# lin_terms <- c("road_dist", "fence_dist")   # continuous alternative
+
+# Linear-features-only model: fit, save coefficients, build the surface
+run_linear_only <- function(season, terms = lin_terms, tag = "linearonly",
+                            clip = c(0, 1)) {
+
+# 1. Fit linear terms + movement kernel, stratified by step
+  dat <- readRDS(here("outputs", paste0("ele_trk_extract_kaza_", season, ".rds"))) |>
+    as.data.frame()
+  dat <- dat[complete.cases(dat[, c("case_", "step_id_", "sl_", "log_sl_",
+                                    "cos_ta_", terms)]), ]
+
+  f <- reformulate(c(terms, "sl_", "log_sl_", "cos_ta_", "strata(step_id_)"),
+                   response = "case_")
+  m <- clogit(f, data = dat, method = "efron")
+  print(summary(m))
+  message("AIC (", season, "): ", AIC(m))
+
+  saveRDS(list(coefficients = coef(m)),
+          here("outputs", paste0("m_kaza_", season, "_", tag, "_coefonly.rds")))
+
+# 2. Predict only the linear terms enter the surface (movement terms dropped)
+  cov_stack <- build_covariate_stack(season)
+  lp <- predict_ssf_surface(list(coefficients = coef(m)), cov_stack, keep = terms)
+  lp <- mask(lp, valid_area_kaza)
+  print(global(lp, c("min", "max", "mean", "sd"), na.rm = TRUE))
+
+# 3. Convert to resistance and save
+  res <- lp_to_resistance(lp, clip = clip)
+  writeRaster(res, file.path(out_folder,
+              paste0("resistance_", pop_label, "_", season, "_", tag, ".tif")),
+              overwrite = TRUE)
+  res
+}
+
+res_wet_linear <- run_linear_only("wet")
+res_dry_linear <- run_linear_only("dry")
+
+plot(res_wet_linear, main = "KAZA Wet: linear-features-only resistance")
+plot(res_dry_linear, main = "KAZA Dry: linear-features-only resistance")
+
+```
+```{r}
+list.files(here("outputs"), pattern = "ele_trk", recursive = TRUE, full.names = TRUE)
+list.files(here(), pattern = "extract.*\\.rds$", recursive = TRUE, full.names = TRUE)
 ```
 
