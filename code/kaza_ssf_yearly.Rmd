@@ -1,0 +1,229 @@
+---
+title: "kaza_ssf_yearly"
+author: "Rachel Frost"
+date: "2026-10-10"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# =====================================================================
+# KAZA SSF — canonical base model (no elevation) + hydrological-year fits
+# Standalone: loads the saved extractions from kaza_ssf.Rmd and fits.
+# =====================================================================
+
+library(tidyverse)  
+library(here)
+library(amt)
+library(survival)
+select <- dplyr::select
+
+# ---------------------------------------------------------------------
+# Step 0: Load saved extractions (same folder for dry and wet)
+# ---------------------------------------------------------------------
+ele_trk_extract_dry <- readRDS(here("outputs", "ele_trk_extract_kaza_dry.rds"))
+ele_trk_extract_wet <- readRDS(here("outputs", "ele_trk_extract_kaza_wet.rds"))
+
+# Checks before fitting:
+# 1. step_id must be id-prefixed (e.g. "AM105_12"), or strata collide across elephants
+head(unique(ele_trk_extract_dry$step_id))
+# 2. columns the script relies on
+stopifnot(all(c("id", "t1_", "case_", "step_id", "aspect") %in% names(ele_trk_extract_dry)))
+# 3. object class survived saving (should include "random_steps")
+class(ele_trk_extract_dry)
+
+```
+
+```{r}
+# ---------------------------------------------------------------------
+# Step 6a: Canonical base formula (team decision: linear, no elevation)
+# ---------------------------------------------------------------------
+# aspect is circular (0 and 360 are the same direction), so it enters as
+# northness/eastness instead of raw degrees.
+base_vars <- c(
+  "core_dist", "water_rivers_dist", "tree_cover_dist", "grassland_dist",
+  "shrubland_dist", "cropland_dist", "urban_dist", "fence_dist", "road_dist",
+  "slope", "northness", "eastness", "evi", "world_pop"
+)
+
+f_base <- reformulate(c(base_vars, "strata(step_id)"), response = "case_")
+
+# ---------------------------------------------------------------------
+# Step 6b: Prep — hydrological year, aspect transform, complete strata
+# ---------------------------------------------------------------------
+# Hydrological year runs Nov–Oct and is labelled by the year it ENDS:
+# Nov 2015 – Oct 2016 = HY 2016 (wet Nov–Apr, then dry May–Oct).
+# Assigned on t1_, which used and available steps in a stratum share,
+# so a stratum is never split across years.
+prep_ssf <- function(data) {
+  cls <- class(data)
+  out <- data |>
+    mutate(
+      hydro_year = if_else(month(t1_) >= 11, year(t1_) + 1L, year(t1_)),
+      northness  = cos(aspect * pi / 180),
+      eastness   = sin(aspect * pi / 180)
+    ) |>
+    drop_na(all_of(base_vars)) |>
+    # keep only strata that still have a used step AND >= 1 available
+    group_by(step_id) |>
+    filter(any(case_) & any(!case_)) |>
+    ungroup()
+  class(out) <- cls
+  out
+}
+
+dry_prep <- prep_ssf(ele_trk_extract_dry)
+wet_prep <- prep_ssf(ele_trk_extract_wet)
+
+# Sanity checks: aspect should be degrees 0–360; check hydro-year coverage
+range(ele_trk_extract_dry$aspect, na.rm = TRUE)
+count(as_tibble(dry_prep), hydro_year, case_)
+
+# ---------------------------------------------------------------------
+# Step 6c: Fixed scaling (computed once on pooled data, reused everywhere)
+# ---------------------------------------------------------------------
+# Yearly coefficients are only comparable if every year is scaled with the
+# SAME constants. Save these; the rasters must be scaled identically when
+# building the resistance surface.
+get_scaling <- function(data, vars) {
+  tibble(
+    var  = vars,
+    mean = map_dbl(vars, ~ mean(data[[.x]], na.rm = TRUE)),
+    sd   = map_dbl(vars, ~ sd(data[[.x]], na.rm = TRUE))
+  )
+}
+
+apply_scaling <- function(data, sc) {
+  for (i in seq_len(nrow(sc))) {
+    data[[sc$var[i]]] <- (data[[sc$var[i]]] - sc$mean[i]) / sc$sd[i]
+  }
+  data
+}
+
+sc_dry <- get_scaling(dry_prep, base_vars)
+sc_wet <- get_scaling(wet_prep, base_vars)
+
+# ---------------------------------------------------------------------
+# Step 6d: Pooled base model (replaces m0 for resistance surfaces)
+# ---------------------------------------------------------------------
+m_base_dry <- dry_prep |> apply_scaling(sc_dry) |> fit_ssf(f_base, model = FALSE)
+m_base_wet <- wet_prep |> apply_scaling(sc_wet) |> fit_ssf(f_base, model = FALSE)
+
+summary(m_base_dry)
+summary(m_base_wet)
+
+# ---------------------------------------------------------------------
+# Step 6e: Per-hydrological-year fits with sample-size gate
+# ---------------------------------------------------------------------
+# min_ids / min_used are placeholders — agree on thresholds with the team.
+fit_by_year <- function(prep, sc, min_ids = 5, min_used = 2000) {
+  cls <- class(prep)
+
+  samples <- prep |>
+    as_tibble() |>
+    filter(case_) |>
+    group_by(hydro_year) |>
+    summarise(n_elephants = n_distinct(id), n_used = n(), .groups = "drop") |>
+    mutate(fitted = n_elephants >= min_ids & n_used >= min_used)
+
+  keep <- samples |> filter(fitted) |> pull(hydro_year)
+
+  fits <- map(set_names(keep), \(yr) {
+    d <- prep |> filter(hydro_year == yr)
+    class(d) <- cls
+    d |> apply_scaling(sc) |> fit_ssf(f_base, model = FALSE)
+  })
+
+  list(samples = samples, fits = fits)
+}
+
+yr_dry <- fit_by_year(dry_prep, sc_dry)
+yr_wet <- fit_by_year(wet_prep, sc_wet)
+
+print(yr_dry$samples, n = Inf)
+print(yr_wet$samples, n = Inf)
+
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+summary(cars)
+```
+
+```{r}
+# ---------------------------------------------------------------------
+# Step 6f: Coefficients across years vs pooled (answers "what varies?")
+# ---------------------------------------------------------------------
+tidy_fit <- function(fit) {
+  s <- summary(fit$model)$coefficients
+  tibble(term = rownames(s), estimate = s[, "coef"], se = s[, "se(coef)"])
+}
+
+coef_by_year <- bind_rows(
+  map_dfr(yr_dry$fits, tidy_fit, .id = "hydro_year") |> mutate(season = "dry"),
+  map_dfr(yr_wet$fits, tidy_fit, .id = "hydro_year") |> mutate(season = "wet")
+)
+
+coef_pooled <- bind_rows(
+  tidy_fit(m_base_dry) |> mutate(season = "dry"),
+  tidy_fit(m_base_wet) |> mutate(season = "wet")
+)
+
+ggplot(coef_by_year, aes(x = hydro_year, y = estimate)) +
+  geom_hline(yintercept = 0, colour = "grey70") +
+  geom_hline(data = coef_pooled, aes(yintercept = estimate),
+             linetype = "dashed", colour = "steelblue") +
+  geom_pointrange(aes(ymin = estimate - 1.96 * se, ymax = estimate + 1.96 * se),
+                  size = 0.2) +
+  facet_grid(term ~ season, scales = "free_y") +
+  labs(x = "Hydrological year (Nov–Oct, labelled by end year)",
+       y = "Scaled coefficient",
+       title = "KAZA SSF base model: yearly vs pooled (dashed) coefficients") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        strip.text.y = element_text(angle = 0))
+
+# ---------------------------------------------------------------------
+# Step 6g: Save
+# ---------------------------------------------------------------------
+saveRDS(list(dry = m_base_dry, wet = m_base_wet),
+        here("outputs", "kaza_ssf_base_pooled.rds"))
+saveRDS(list(dry = yr_dry, wet = yr_wet),
+        here("outputs", "kaza_ssf_base_by_hydroyear.rds"))
+saveRDS(list(dry = sc_dry, wet = sc_wet, vars = base_vars),
+        here("outputs", "kaza_ssf_base_scaling.rds"))
+```
+
+```{r}
+# ---------------------------------------------------------------------
+# Step 6g: Save
+# ---------------------------------------------------------------------
+saveRDS(list(dry = m_base_dry, wet = m_base_wet),
+        here("outputs", "kaza_ssf_base_pooled.rds"))
+saveRDS(list(dry = yr_dry, wet = yr_wet),
+        here("outputs", "kaza_ssf_base_by_hydroyear.rds"))
+saveRDS(list(dry = sc_dry, wet = sc_wet, vars = base_vars),
+        here("outputs", "kaza_ssf_base_scaling.rds"))
+```
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+summary(cars)
+```
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
