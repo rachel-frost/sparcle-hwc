@@ -76,7 +76,7 @@ print(coverage, n = Inf)   # >>> NEW: actually print it
 ```{r formula}
 base_vars <- c(
   # >>> REMOVED: core_dist (~99% zeros; collared elephants stay inside the park)
-  "water_rivers_dist", "tree_cover_dist", "grassland_dist", "shrubland_dist",
+  "water_rivers_dist", "tree_cover", "grassland", "shrubland",
   "cropland_dist", "urban_dist", "fence_dist", "road_dist",
   "elevation",
   "slope", "northness", "eastness", "evi", "world_pop"
