@@ -310,12 +310,14 @@ extract_world_pop <- function(ele_trk){
 
 lc_types <- c("cropland", "grassland", "shrubland", "tree_cover", "urban", "water_rivers")
 lc_dist_folder <- here("data", "ESACCI_LCCS", "lc_dist_2")
+lc_binary_folder <- here("data", "ESACCI_LCCS", "landcover")
 
-extract_lc_dist <- function(ele_trk){
+extract_lc_mixed <- function(ele_trk){
   ele_trk_mutated <- ele_trk
   if(!"year" %in% colnames(ele_trk)){
     ele_trk_mutated <- ele_trk_mutated |>
-      mutate(year = year(t2_))}    
+      mutate(year = year(t2_))
+  }   
 
   new_trk <- tibble()
   
@@ -325,26 +327,32 @@ extract_lc_dist <- function(ele_trk){
     if(nrow(lc_extract) == 0){next}
     
     r_list <- list()
-    for(i in 1:length(lc_types)){
-      lc <- lc_types[i]
+    
+    # 1. Distance rasters for cropland, urban, water_rivers (Keep _dist)
+    dist_types <- c("cropland", "urban", "water_rivers")
+    for(i in seq_along(dist_types)){
+      lc <- dist_types[i]
       r <- rast(paste0(lc_dist_folder, "/", "dist_", lc, "_", yr, ".tif"))
       names(r) <- paste0(lc, "_dist")
-      r_list[[i]] <- r
+      r_list[[length(r_list) + 1]] <- r
     }
+    
+    # 2. Binary land cover rasters for tree_cover, shrubland, grassland (NO _dist)
+    bin_types <- c("tree_cover", "shrubland", "grassland")
+    for(i in seq_along(bin_types)){
+      lc <- bin_types[i]
+      r <- rast(paste0(lc_binary_folder, "/", "lc_", lc, "_", yr, ".tif"))
+      names(r) <- lc  # Notice: exactly matching column name without "_dist"
+      r_list[[length(r_list) + 1]] <- r
+    }
+    
     r_stack <- rast(r_list)
     
     lc_extract <- lc_extract |> 
       extract_covariates(r_stack)
-    #   mutate(lc_dist_list = extract_covariates_along(lc_extract, r_stack)) |> 
-    #   mutate(lc_dist_means = map(lc_dist_list, function(df){
-    #   if(nrow(df) > 1){as.data.frame(t(colMeans(df, na.rm = TRUE)))
-    #     } else{as.data.frame(df)}
-    # }))
     
     new_trk <- bind_rows(new_trk, lc_extract)
   }
-  # new_trk <- new_trk |> 
-  #   unnest(cols = lc_dist_means)
   
   class(new_trk) <- class(ele_trk)
   return(new_trk)
@@ -442,7 +450,7 @@ for (i in seq_len(n_batches)) {
       extract_evi() |> 
       extract_world_pop() |> 
       extract_static() |> 
-      extract_lc_dist() |> 
+      extract_lc_mixed() |> 
       extract_linear()
   }, error = function(e) {
     cat("BATCH", i, "FAILED (rows", start_row, "-", end_row, "):", conditionMessage(e), "\n")
@@ -563,8 +571,8 @@ ele_trk_extract_west_dry <- ele_trk_extract_west |>
 # etosha batch extraction 
 m0_etosha_wet <- ele_trk_extract_etosha_wet |> fit_clogit(case_ ~ 
                                             core_dist + fence_dist + road_dist + water_rivers_dist +
-                                            cropland_dist + grassland_dist + shrubland_dist + 
-                                            urban_dist + tree_cover_dist +
+                                            cropland_dist + grassland + shrubland + 
+                                            urban_dist + tree_cover +
                                             elevation + slope + aspect + 
                                             evi + world_pop + strata(step_id_),
                                           model = FALSE)
@@ -572,8 +580,8 @@ summary(m0_etosha_wet)
 
 m0_etosha_dry <- ele_trk_extract_etosha_dry |> fit_clogit(case_ ~ 
                                             core_dist + fence_dist + road_dist + water_rivers_dist +
-                                            cropland_dist + grassland_dist + shrubland_dist + 
-                                            urban_dist + tree_cover_dist +
+                                            cropland_dist + grassland + shrubland + 
+                                            urban_dist + tree_cover +
                                             elevation + slope + aspect + 
                                             evi + world_pop + strata(step_id_),
                                           model = FALSE)
@@ -583,8 +591,8 @@ summary(m0_etosha_dry)
 m0_west_wet <- ele_trk_extract_west_wet |> fit_clogit(case_ ~ 
                                             core_dist + fence_dist + road_dist +
                                             water_rivers_dist +
-                                            cropland_dist + grassland_dist + shrubland_dist + 
-                                            urban_dist + tree_cover_dist +
+                                            cropland_dist + grassland + shrubland + 
+                                            urban_dist + tree_cover +
                                             elevation + slope + aspect + 
                                             evi + world_pop + strata(step_id_),
                                           model = FALSE)
@@ -593,8 +601,8 @@ summary(m0_west_wet)
 m0_west_dry <- ele_trk_extract_west_dry |> fit_clogit(case_ ~ 
                                             core_dist + fence_dist + road_dist +
                                             water_rivers_dist +
-                                            cropland_dist + grassland_dist + shrubland_dist + 
-                                            urban_dist + tree_cover_dist +
+                                            cropland_dist + grassland + shrubland + 
+                                            urban_dist + tree_cover +
                                             elevation + slope + aspect + 
                                             evi + world_pop + strata(step_id_),
                                           model = FALSE)
