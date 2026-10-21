@@ -611,6 +611,127 @@ for (f in files) {
 message("Done.")
 ```
 
+```{r}
+# =========================================================
+# Optimized Binary Land Cover ONLY rasters from ESA CCI / C3S LCCS data
+# =========================================================
+library(terra)
 
+terraOptions(memfrac = 0.9, progress = 1)
+
+# -----------------------------
+# 1. USER CONFIGURATION
+# -----------------------------
+data_dir <- "~/Desktop/Arnhold/sparcle-hwc-old2/code/sparcle-hwc/data/ESACCI_LCCS"
+out_dir  <- "~/Desktop/Arnhold/sparcle-hwc-old2/code/sparcle-hwc/data/ESACCI_LCCS/landcover"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+common_ext   <- ext(12.5, 25.5, -21.5, -16.5)
+common_crs   <- "EPSG:4326"
+target_res_m <- 500
+template_file <- "~/Desktop/Arnhold/sparcle-hwc-old2/code/sparcle-hwc/data/500m_data/terrain_rast_500m.tif"
+buffer_deg   <- 0
+
+# AUTOMATIC METRIC CRS SELECTION (UTM Zone 34S matches center of your coordinates)
+metric_crs   <- "EPSG:32734" 
+
+# -----------------------------
+# 2. LAND COVER GROUPS (Tree cover, Shrubland, Grassland only)
+# -----------------------------
+lc_groups <- list(
+  tree_cover = c(50, 60, 61, 62, 70, 71, 72, 80, 81, 82, 90, 100, 160, 170),
+  shrubland  = c(120, 121, 122, 180),
+  grassland  = c(110, 130)
+)
+
+# -----------------------------
+# 3. FILE NAMING
+# -----------------------------
+years_v207 <- 2008:2015
+years_v211 <- 2016:2020
+
+nc_path <- function(year) {
+  if (year %in% years_v207) {
+    file.path(data_dir, sprintf("ESACCI-LC-L4-LCCS-Map-300m-P1Y-%d-v2.0.7cds.area-subset.-16.5.25.5.-21.5.12.5.nc", year))
+  } else if (year %in% years_v211) {
+    file.path(data_dir, sprintf("C3S-LC-L4-LCCS-Map-300m-P1Y-%d-v2.1.1.area-subset.-16.5.25.5.-21.5.12.5.nc", year))
+  } else {
+    stop("Year ", year, " is not listed.")
+  }
+}
+
+# -----------------------------
+# 4. HELPER FUNCTIONS
+# -----------------------------
+read_lc_raster <- function(year) {
+  f <- nc_path(year)
+  if (!file.exists(f)) stop("File not found: ", f)
+  rast(f, subds = "lccs_class")
+}
+
+build_template <- function() {
+  if (!is.null(template_file)) {
+    if (!file.exists(template_file)) stop("Template file not found: ", template_file)
+    tmpl <- rast(template_file)
+    if (!same.crs(tmpl, common_crs)) {
+      warning("Template raster CRS is not EPSG:4326 -- reprojecting template.")
+      tmpl <- project(tmpl, common_crs)
+    }
+  } else {
+    res_deg <- target_res_m / 111320
+    tmpl <- rast(ext = common_ext, resolution = res_deg, crs = common_crs)
+  }
+  tmpl
+}
+
+target_template <- build_template()
+buffered_ext    <- ext(common_ext[1] - buffer_deg, common_ext[2] + buffer_deg, common_ext[3] - buffer_deg, common_ext[4] + buffer_deg)
+
+make_lc_raster_fast <- function(lc_raster_metric, values, group_name, year) {
+  # Reclassify on the metric grid (1 for target class, NA for others)
+  rcl <- matrix(c(values, rep(1, length(values))), ncol = 2)
+  target <- classify(lc_raster_metric, rcl = rcl, others = NA)
+  
+  # Project and resample the binary raster back to your EPSG:4326 template using "near"
+  lc_r <- project(target, target_template, method = "near")
+  
+  names(lc_r) <- paste0("lc_", group_name, "_", year)
+  lc_r
+}
+
+# -----------------------------
+# 5. MAIN LOOP
+# -----------------------------
+all_years <- c(years_v207, years_v211)
+
+for (yr in all_years) {
+  message("Processing year ", yr, " ...")
+  lc <- read_lc_raster(yr)
+  lc <- crop(lc, buffered_ext)
+  
+  # Project the categorical grid to Metric ONCE per year
+  t0 <- Sys.time()
+  lc_metric <- project(lc, metric_crs, method = "near")
+  lc_metric <- toMemory(lc_metric)
+  message(" Projected to metric and loaded to RAM in ", round(difftime(Sys.time(), t0, units = "secs"), 1), " sec")
+  
+  for (grp in names(lc_groups)) {
+    out_file <- file.path(out_dir, paste0("lc_", grp, "_", yr, ".tif"))
+    if (file.exists(out_file)) {
+      message(" Skipping ", grp, " (already exists)")
+      next
+    }
+    
+    t1 <- Sys.time()
+    message(" -> extracting binary raster for ", grp, " ...")
+    lc_r <- make_lc_raster_fast(lc_metric, lc_groups[[grp]], grp, yr)
+    writeRaster(lc_r, out_file, overwrite = TRUE)
+    message(" done in ", round(difftime(Sys.time(), t1, units = "secs"), 2), " secs")
+  }
+  rm(lc_metric)
+}
+
+message("Done. Land cover rasters written to: ", out_dir)
 ```
+
 
