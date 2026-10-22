@@ -429,8 +429,14 @@ batch_size <- 50000
 n_total <- nrow(ele_etosha_reg)
 n_batches <- ceiling(n_total / batch_size)
 
-pipeline_dir <- here("data", paste0("batch_output_etosha_hr6_", nrow(ele_etosha_reg)))
+#old 6 hr data
+#pipeline_dir <- here("data", paste0("batch_output_etosha_hr6_", nrow(ele_etosha_reg)))
+#dir.create(pipeline_dir, showWarnings = FALSE)
+
+# >>> CHANGED: new folder so old distance-to batches aren't reused; create it after naming
+pipeline_dir <- here("data", paste0("batch_output_etosha_hr1_lcmixed_", nrow(ele_etosha_reg)))
 dir.create(pipeline_dir, showWarnings = FALSE)
+dir.exists(pipeline_dir)  # TRUE
 
 failed_batches <- c()
 
@@ -560,6 +566,15 @@ ele_trk_extract_west_wet <- ele_trk_extract_west |>
  filter(season == "wet")
 ele_trk_extract_west_dry <- ele_trk_extract_west |> 
  filter(season == "dry")
+
+#added to change NA values in land cover to 0
+ele_trk_extract_etosha_wet <- ele_trk_extract_etosha_wet |>
+  mutate(across(c(grassland, shrubland, tree_cover), ~ replace_na(.x, 0)))
+
+ele_trk_extract_etosha_dry <- ele_trk_extract_etosha_dry |>
+  mutate(across(c(grassland, shrubland, tree_cover), ~ replace_na(.x, 0)))
+
+sum(complete.cases(ele_trk_extract_etosha_wet[, vars]))  # should be ~3.7M now
 ```
 
 
@@ -570,7 +585,8 @@ ele_trk_extract_west_dry <- ele_trk_extract_west |>
 ```{r}
 # etosha batch extraction 
 m0_etosha_wet <- ele_trk_extract_etosha_wet |> fit_clogit(case_ ~ 
-                                            core_dist + fence_dist + road_dist + water_rivers_dist +
+                                            core_dist + fence_dist + road_dist + 
+                                            water_rivers_dist +
                                             cropland_dist + grassland + shrubland + 
                                             urban_dist + tree_cover +
                                             elevation + slope + aspect + 
@@ -608,6 +624,47 @@ m0_west_dry <- ele_trk_extract_west_dry |> fit_clogit(case_ ~
                                           model = FALSE)
 summary(m0_west_dry)
 
+```
+```{r}
+#new experimental models for etosha to test year and dropping core area
+
+#drop core dist since Etosha steps are majority core area
+m0_etosha_wet <- ele_trk_extract_etosha_wet |> fit_clogit(case_ ~ 
+                                            fence_dist + road_dist + 
+                                            water_rivers_dist +
+                                            cropland_dist + grassland + shrubland + 
+                                            urban_dist + tree_cover +
+                                            elevation + slope + aspect + 
+                                            evi + world_pop + strata(step_id_),
+                                          model = FALSE)
+summary(m0_etosha_wet)
+
+m0_etosha_dry <- ele_trk_extract_etosha_dry |> fit_clogit(case_ ~ 
+                                            fence_dist + road_dist + water_rivers_dist +
+                                            cropland_dist + grassland + shrubland + 
+                                            urban_dist + tree_cover +
+                                            elevation + slope + aspect + 
+                                            evi + world_pop + strata(step_id_),
+                                          model = FALSE)
+
+#test year as a variable 
+m0_etosha_wet <- ele_trk_extract_etosha_wet |> fit_clogit(case_ ~ 
+                                            year + core_dist + fence_dist + road_dist + 
+                                            water_rivers_dist +
+                                            cropland_dist + grassland + shrubland + 
+                                            urban_dist + tree_cover +
+                                            elevation + slope + aspect + 
+                                            evi + world_pop + strata(step_id_),
+                                          model = FALSE)
+summary(m0_etosha_wet)
+
+m0_etosha_dry <- ele_trk_extract_etosha_dry |> fit_clogit(case_ ~ 
+                                            year + core_dist + fence_dist + road_dist + water_rivers_dist +
+                                            cropland_dist + grassland + shrubland + 
+                                            urban_dist + tree_cover +
+                                            elevation + slope + aspect + 
+                                            evi + world_pop + strata(step_id_),
+                                          model = FALSE)
 ```
 
 ```{r}
