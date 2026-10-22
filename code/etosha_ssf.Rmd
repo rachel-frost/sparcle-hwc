@@ -306,7 +306,7 @@ extract_world_pop <- function(ele_trk){
 ```
 
 ```{r}
-# Land cover dist extraction
+# Land cover and distance extraction
 
 lc_types <- c("cropland", "grassland", "shrubland", "tree_cover", "urban", "water_rivers")
 lc_dist_folder <- here("data", "ESACCI_LCCS", "lc_dist_2")
