@@ -26,8 +26,12 @@ evi_folder <- file.path(static_folder, "EVI data")
 
 # Annual "distance to land cover type" rasters (2008-2020, one per type/year)
 lc_dist_folder <- file.path(base_dir, "ESACCI_LCCS", "lc_dist_2")
-lc_types <- c("cropland", "grassland", "shrubland", "tree_cover", "urban", "water_rivers")
+lc_dist_types <- c("cropland", "urban", "water_rivers")
 lc_dist_years  <- 2008:2020
+
+#Annual categorical land cover rasters (replace distance rasters for these types)
+lc_cat_folder <- file.path(base_dir, "ESACCI_LCCS", "landcover")
+lc_cat_types <- c("grassland", "shrubland", "tree_cover")
 
 # Movement data (one source per population)
 kaza_file      <- file.path(base_dir, "elephant_2010-Feb2020.csv")                 # single CSV, multiple individuals
@@ -290,8 +294,8 @@ run_multicollinearity_by_year <- function(elephant_df, season_label, evi_season,
     # fallback happens inside match_year_band, e.g. for years outside
     # 2008-2020, same handling as worldpop).
     lc_dist_r <- lapply(names(lc_dist_stacks), function(lt) {
-      match_year_band(lc_dist_stacks[[lt]], yr, paste0("dist_", lt))
-    })
+  match_year_band(lc_dist_stacks[[lt]], yr, lt)
+})
 
     covariates_yr <- c(static_stack, evi_r, worldpop_r, do.call(c, lc_dist_r))
 
@@ -364,8 +368,8 @@ names(worldpop_stack)  # should show "2000".."2020" -- confirms band-year mappin
 #matches per point-year, same as worldpop and EVI 
 #cropland, grassland, shrubland, tree cover, urvan, and water covariates 
 #File names "dist_type_year.tif", one band per file, stacked
-lc_dist_stacks <- setNames(
-  lapply(lc_types, function(lt) {
+dist_stacks <- setNames(
+  lapply(lc_dist_types, function(lt) {
     build_annual_stack_from_files(
       folder      = lc_dist_folder,
       file_prefix = paste0("dist_", lt, "_"),
@@ -373,8 +377,24 @@ lc_dist_stacks <- setNames(
       template    = static_template
     )
   }),
-  lc_types
+  paste0("dist_", lc_dist_types)
 )
+
+# Categorical land cover stacks (grassland, shrubland, tree_cover): lc_<type>_<year>.tif
+cat_stacks <- setNames(
+  lapply(lc_cat_types, function(lt) {
+    build_annual_stack_from_files(
+      folder      = lc_cat_folder,
+      file_prefix = paste0("lc_", lt, "_"),
+      years       = lc_dist_years,
+      template    = static_template
+    )
+  }),
+  paste0("lc_", lc_cat_types)
+)
+
+# Combined: names are the final layer names used in the extraction
+lc_dist_stacks <- c(dist_stacks, cat_stacks)
 
 # check: each stack should show bands "2008".."2020"
 lapply(lc_dist_stacks, names)
