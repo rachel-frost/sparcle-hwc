@@ -613,7 +613,8 @@ message("Done.")
 
 ```{r}
 # =========================================================
-# Optimized Binary Land Cover ONLY rasters from ESA CCI / C3S LCCS data
+# Binary (1/0) Land Cover rasters from ESA CCI / C3S LCCS data
+# Target class = 1, all other classes = 0, true NoData stays NA
 # =========================================================
 library(terra)
 
@@ -633,7 +634,11 @@ template_file <- "~/Desktop/Arnhold/sparcle-hwc-old2/code/sparcle-hwc/data/500m_
 buffer_deg   <- 0
 
 # AUTOMATIC METRIC CRS SELECTION (UTM Zone 34S matches center of your coordinates)
-metric_crs   <- "EPSG:32734" 
+metric_crs   <- "EPSG:32734"
+
+# TRUE = rewrite existing files (needed once to replace the old 1/NA rasters).
+# Set back to FALSE afterwards if you want the loop to skip finished files.
+overwrite_existing <- TRUE
 
 # -----------------------------
 # 2. LAND COVER GROUPS (Tree cover, Shrubland, Grassland only)
@@ -688,13 +693,14 @@ target_template <- build_template()
 buffered_ext    <- ext(common_ext[1] - buffer_deg, common_ext[2] + buffer_deg, common_ext[3] - buffer_deg, common_ext[4] + buffer_deg)
 
 make_lc_raster_fast <- function(lc_raster_metric, values, group_name, year) {
-  # Reclassify on the metric grid (1 for target class, NA for others)
+  # Reclassify on the metric grid: 1 for target classes, 0 for all other classes.
+  # Cells that are already NA in the source (true NoData) stay NA.
   rcl <- matrix(c(values, rep(1, length(values))), ncol = 2)
-  target <- classify(lc_raster_metric, rcl = rcl, others = NA)
-  
+  target <- classify(lc_raster_metric, rcl = rcl, others = 0)
+
   # Project and resample the binary raster back to your EPSG:4326 template using "near"
   lc_r <- project(target, target_template, method = "near")
-  
+
   names(lc_r) <- paste0("lc_", group_name, "_", year)
   lc_r
 }
@@ -708,30 +714,41 @@ for (yr in all_years) {
   message("Processing year ", yr, " ...")
   lc <- read_lc_raster(yr)
   lc <- crop(lc, buffered_ext)
-  
+
   # Project the categorical grid to Metric ONCE per year
   t0 <- Sys.time()
   lc_metric <- project(lc, metric_crs, method = "near")
   lc_metric <- toMemory(lc_metric)
   message(" Projected to metric and loaded to RAM in ", round(difftime(Sys.time(), t0, units = "secs"), 1), " sec")
-  
+
   for (grp in names(lc_groups)) {
     out_file <- file.path(out_dir, paste0("lc_", grp, "_", yr, ".tif"))
-    if (file.exists(out_file)) {
+    if (file.exists(out_file) && !overwrite_existing) {
       message(" Skipping ", grp, " (already exists)")
       next
     }
-    
+
     t1 <- Sys.time()
     message(" -> extracting binary raster for ", grp, " ...")
     lc_r <- make_lc_raster_fast(lc_metric, lc_groups[[grp]], grp, yr)
-    writeRaster(lc_r, out_file, overwrite = TRUE)
+    writeRaster(lc_r, out_file, overwrite = TRUE, datatype = "INT1U", NAflag = 255)
     message(" done in ", round(difftime(Sys.time(), t1, units = "secs"), 2), " secs")
   }
   rm(lc_metric)
 }
 
 message("Done. Land cover rasters written to: ", out_dir)
+
+# -----------------------------
+# 6. QUICK CHECK (should show values 0 and 1)
+# -----------------------------
+# freq(rast(file.path(out_dir, "lc_grassland_2010.tif")))
+```
+```{r}
+# -----------------------------
+# 6. QUICK CHECK (should show values 0 and 1)
+# -----------------------------
+ freq(rast(file.path(out_dir, "lc_grassland_2010.tif")))
 ```
 
 
