@@ -1,0 +1,76 @@
+---
+title: "experiments_etosha"
+format: html
+editor: visual
+---
+
+```{r}
+#load libraries 
+#| include: false
+# ----- setup -----
+library(tidyverse)
+library(janitor)
+library(here)
+library(terra)
+library(amt)
+library(survival)
+library(broom)
+select <- dplyr::select
+
+here()   # checkpoint: should end in /sparcle-hwc
+```
+
+```{r}
+# ===== EXPERIMENT CONFIG =====
+# >>> CHANGE THESE when switching to precip + categorical land cover
+data_version <- "v1_1h_lcdist"
+input_file   <- here("outputs", "ele_trk_extract_etosha_1h.rds")
+
+hab_terms <- c("fence_dist", "road_dist", "water_rivers_dist", "cropland_dist",
+               "grassland_dist", "shrubland_dist", "tree_cover_dist", "urban_dist",
+               "elevation", "slope", "aspect", "evi", "world_pop")
+mov_terms <- character(0)
+
+# extraction functions that match how input_file was built (for the 6h/12h tests)
+extract_lc_fun <- readRDS(here("outputs", "extract_lc_dist.rds"))
+# later: extract_lc_fun <- extract_lc_mixed   (after source()-ing ssf_functions.R)
+# ==============================
+
+exp_dir <- here("outputs", "experiments_etosha", data_version)
+dir.create(exp_dir, showWarnings = FALSE, recursive = TRUE)
+base_rhs <- paste(c(hab_terms, mov_terms), collapse = " + ")
+```
+
+You can add options to executable code like this
+
+```{r}
+#| echo: false
+#chunk 1: load all data
+ele_trk_extract_etosha <- readRDS(input_file)
+cat("rows:", nrow(ele_trk_extract_etosha), "\n")
+
+# checkpoint: every model term exists in the data
+setdiff(c(hab_terms, mov_terms), names(ele_trk_extract_etosha))   # should be character(0)
+
+complete_data <- ele_trk_extract_etosha |>
+  mutate(step_id_ = if (any(grepl("_", step_id_))) step_id_ else paste(id, step_id_, sep = "_")) |>
+  grep("hydro_year", readLines(here("code", "etosha_yearly_ssf.Rmd")), value = TRUE) |>
+  drop_na(all_of(c(hab_terms, mov_terms)))
+
+cat("complete rows:", nrow(complete_data), "\n")
+complete_data |> count(hydro_year, season)
+
+sandbox <- complete_data |> filter(hydro_year == 2015, season == "dry")
+cat("sandbox:", n_distinct(sandbox$id), "elephants,", n_distinct(sandbox$step_id_), "strata\n")
+```
+
+```{r}
+# >>> CHANGED inside run_extraction()
+reg[rows, ] |> extract_evi() |> extract_world_pop() |> extract_static() |>
+  extract_lc_fun() |> extract_linear()
+
+xextract_evi       <- readRDS(here("outputs", "extract_evi.rds"))
+extract_world_pop <- readRDS(here("outputs", "extract_world_pop.rds"))
+extract_static    <- readRDS(here("outputs", "extract_static.rds"))
+extract_linear    <- readRDS(here("outputs", "extract_linear.rds"))
+```
