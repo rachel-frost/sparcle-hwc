@@ -1,0 +1,239 @@
+---
+title: "SSF_Validation"
+author: "Marissa Brenner"
+date: "2026-10-15"
+output: html_document
+---
+#===============================
+#Used-Habitat Calibration 
+#===============================
+
+```{r}
+# =====================================================================
+# Setting up UHC
+# =====================================================================
+
+#Load folders of rds batch files 
+etosha_dir <- here("data", "batch_output_etosha_XXXX")
+west_dir <- here ("data", "batch_output_west_XXX")
+
+#covariates in SSF 
+base_terms <- c("core_dist", "fence_dist", "road_dist",
+                "water_rivers_dist", "cropland_dist", "grassland",
+                "shrubland", "urban_dist", "tree_cover", "elevation",
+                "slope", "aspect", "evi", "world_pop")
+
+# extra_vars are covariates kept in the test data but NOT in the model. THey are plotted anyway. 
+model_specs <- list(
+  etosha_wet = list(pop = "etosha", season = "wet", terms = base_terms, extra_vars = character(0)),
+  etosha_dry = list(pop = "etosha", season = "dry", terms = base_terms, extra_vars = character(0)),
+  west_wet   = list(pop = "west",   season = "wet", terms = base_terms, extra_vars = character(0)),
+  west_dry   = list(pop = "west",   season = "dry", terms = base_terms, extra_vars = character(0))
+  # Example: Etosha without core_dist, but still checking whether core_dist
+  # is needed by plotting it as an extra variable:
+  # etosha_wet_nocore = list(pop = "etosha", season = "wet",
+  #                          terms = setdiff(base_terms, "core_dist"),
+  #                          extra_vars = "core_dist")
+)
+
+prop_train <- 0.8 #80% training / 20% test
+split_by <- "id" #instead of splitting random steps, we are splitting elephants, which is stricter than steps
+n_samp <- 200 #number of bootstrap draws (grey lines). Should actually be around 1000
+
+max_test_strata <- 20000 #cap on number of test strata used 
+seed <- 123 #makes exact same random split and bootstrap draws 
+
+uhc_dir <- here("validation_output", "uhc")
+dir.create(uhc_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+```{r}
+# ---------------------------------------------------------------------
+#Load batches
+# ---------------------------------------------------------------------
+
+#Step 1: generate control steps and attach covariates which was already done in SSF. 
+
+#reload finished products 
+load_batches <- function(dir) {
+  files <- list.files(dir, pattern = "pipeline_batch_.*\\.rds", full.names = TRUE)
+  if (length(files) == 0) stop("No pipeline_batch_*.rds files in: ", dir)
+  message("Reading ", length(files), " batch files from ", basename(dir))
+  
+  # Stack all batch files back into one table
+  dat <- map_dfr(files, readRDS) |> as_tibble()
+  
+  #just making sure step_id is there 
+   if (!"step_id_" %in% names(dat))
+    stop("No 'step_id_' column. Columns: ", paste(names(dat), collapse = ", "))
+  
+  #Taking elephant idenfier colum (id) an dthe current local step id column (step_id) and brings them together to make unique stratum IDs to prevent data from different elephants leaking into the same group
+   dat |> mutate(step_id_ = paste(id, step_id_, sep = "_"))
+   
+}
+# --------------------------------------------------------------------- 
+# add transform 
+# ---------------------------------------------------------------------
+# Not in the vignette: a hook for transformed covariates (sin/cos of aspect, log of population, etc.). It currently does nothing. If you add a transformed variable here, use it in BOTH the SSF and the UHC so the two stay in sync.
+# right now there are only raw variables in the model. If we see in the plots that the black falls outside the envelope for aspect, world_pop, or distance variable, that is a problem. 
+add_transforms <- function(dat) {
+  dat |> mutate(
+    # aspect_sin    = sin(aspect * pi / 180),   # uncomment if aspect is in degrees
+    # aspect_cos    = cos(aspect * pi / 180),
+    # log_world_pop = log1p(world_pop)
+  )
+}
+```
+
+```{r}
+# ---------------------------------------------------------------------
+# clean_for_uhc()
+# ---------------------------------------------------------------------
+#STEP 1 (end): the vignette finishes data prep with
+clean_for_uhc <- function(dat, vars) {
+  # compares list of covariates the model needs (vars) against columns present in the dataframe. Makes sure no varibles are missing. 
+  missing_vars <- setdiff(vars, names(dat))
+  if (length(missing_vars) > 0)
+    stop("Covariates not in data: ", paste(missing_vars, collapse = ", "))
+
+  dat <- dat |>
+    # Looks at the categorical land cover layers, so if a GPS point falls on a pixel where these values are NA, it changes it to 0, so it doesn't drop those rows completely and that it still matches the model. 
+    mutate(across(any_of(c("grassland", "shrubland", "tree_cover")), ~ replace_na(.x, 0))) |>
+    # Scans every row of the dataset across model variables, so if a row contains NA, the row is dropped. Equivalent to the vignette's na.omit().
+    filter(if_all(all_of(vars), is.finite))
+
+  #Groups data by stratum (step_id) and counts the number of case observations and number of available observations. 
+  good <- dat |>
+    group_by(step_id_) |>
+    summarise(n_used = sum(case_), n_avail = sum(!case_), .groups = "drop") |>
+    filter(n_used == 1, n_avail >= 1) #Filters list to only strata that meet that case. 
+
+  semi_join(dat, good, by = "step_id_")   # keep only the intact strata
+}
+
+# ---------------------------------------------------------------------
+# split_train_test()
+# ---------------------------------------------------------------------
+# STEP 2: split into training and testing datasets.
+#We are splitting because we want to see if the test set can be compared agains the model. 
+#The demonstration code splits by steps$train <- rbinom(nrow(steps), 1, 0.8)
+#Here we split by whole stratum instead of row because the data is grouped (80%) into strata(step_id), where 1 used step is compared against available steps. 
+#With by = id, we are holding out entire elephants to know if model can generalize to the broader population
+
+split_train_test <- function(dat, prop_train, by, seed) {
+  set.seed(seed)                                    # reproducible split
+  units <- if (by == "step") unique(dat$step_id_) else unique(dat$id) #
+  train_units <- sample(units, floor(prop_train * length(units)))   # pick ~80% of units
+  is_train <- if (by == "step") dat$step_id_ %in% train_units else dat$id %in% train_units
+  list(train = dat[is_train, ], test = dat[!is_train, ])
+}
+
+# ---------------------------------------------------------------------
+# subsample_strata()
+# ---------------------------------------------------------------------
+#This thins the test set by whole strata to keep the run time manageable since prep_uhc() repeats n_samp
+subsample_strata <- function(dat, n_max, seed) {
+  if (is.null(n_max)) return(dat)                   # no cap requested
+  ids <- unique(dat$step_id_)
+  if (length(ids) <= n_max) return(dat)             # already small enough
+  set.seed(seed)
+  dat |> filter(step_id_ %in% sample(ids, n_max))
+}
+
+# ---------------------------------------------------------------------
+# fit_train_ssf()
+# ---------------------------------------------------------------------
+#STEP 3: use the TRAINING data to fit the candidate model.
+fit_train_ssf <- function(train, terms) {
+  # Build:  case_ ~ term1 + term2 + ... + strata(step_id_)
+  f <- reformulate(c(terms, "strata(step_id_)"), response = "case_")
+  fit_clogit(train, f, model = TRUE)
+}
+
+
+# ---------------------------------------------------------------------
+# run_uhc()
+# ---------------------------------------------------------------------
+# Runs the whole workflow for ONE model (one population x one season).
+run_uhc <- function(pop_dat, spec, model_name) {
+  # All columns we need = model terms + extra candidate variables
+  all_terms <- unique(c(spec$terms, spec$extra_vars))
+  vars      <- unique(all.vars(reformulate(all_terms)))   # underlying column names
+
+  # SAVE TIME: prep_uhc() is slow, so create custom filename label (tag) that includes model name, split, n_samp, and seed.Goes into directory (uhc_dir) to see if file matches existing tag to save time.   
+  tag <- paste(model_name, split_by, paste0("n", n_samp), paste0("s", seed), sep = "_")
+  out_rds <- file.path(uhc_dir, paste0("uhc_", tag, ".rds"))
+  if (file.exists(out_rds)) { message(tag, ": loading saved result"); return(readRDS(out_rds)) }
+  message("=== ", tag, " ===")
+
+  #1: data prep 
+  # Subset to this model's season, apply transforms, clean.
+  # SSF fits wet and dry as separate models, so each gets its own UHC
+  dat <- pop_dat |> filter(season == spec$season) |> add_transforms() |> clean_for_uhc(vars)
+  message("Rows: ", nrow(dat), " | strata: ", n_distinct(dat$step_id_),
+          " | elephants: ", n_distinct(dat$id))
+  
+   #2: split into train and test 
+  sp <- split_train_test(dat, prop_train, split_by, seed)
+  message("Train strata: ", n_distinct(sp$train$step_id_),
+          " | test strata: ", n_distinct(sp$test$step_id_),
+          " | test elephants: ", n_distinct(sp$test$id)) #how many unique strata (step_id_) ended up in train and test, and how many unique animals (id) are in the test set. 
+
+  #Defines list of columns to retain: response (case_), the stratum ID (step_id_) and the covariates same as select(-train)
+  #select(-train) deletes that temporary tracking colimn to make the split. 
+  #keep_cols keeps the important columns and gets rid of everything else
+  keep_cols <- c("case_", "step_id_", vars) 
+  train_dat <- sp$train |> select(all_of(keep_cols))
+  test_dat  <- sp$test  |> select(all_of(keep_cols)) |> subsample_strata(max_test_strata, seed) 
+  
+    #3: fit the candidate model on TRAINING data 
+  # The model only gets to learn from the training set.
+  # Only spec$terms go into the formula. extra_vars stay in test_dat only.
+  m_train <- fit_train_ssf(train_dat, spec$terms)
+  print(summary(m_train))
+  
+    #4: prep_uhc() 
+  set.seed(seed)    # the bootstrap is random, so fix it for reproducibility
+  #running n_samp iterations
+  #draws a new set of coefficients from a multivariate normal distribution based on your model's variance-covariance matrix
+  #resamples test strata with replacement (empirical bootstrap), simulating what would happen if there was a difference sample of animals
+  #calculates distribution of covariates for simulated choices across all iterations (the grey lines)
+  #observed used distribution (black line)
+  #available distribution (red line)
+  uhc <- prep_uhc(object = m_train, test_dat = test_dat, n_samp = n_samp, verbose = TRUE)
+  #saveRDS(uhc, out_rds)
+  
+  #5: plot 
+  #The workflow's plain plot(uhc) draws n_samp grey lines per covariate, which is slow with big n_samp.The workflow itself suggests converting the lines to a confidence envelope:dark grey = 95% of the predicted curves, light grey = 100%.
+  env <- conf_envelope(as.data.frame(uhc), levels = c(0.95, 1))
+  pdf(file.path(uhc_dir, paste0("uhc_plots_", tag, ".pdf")), width = 7, height = 5)
+  plot(env)
+  dev.off()
+
+  # Free memory before the next model (these objects are big)
+  rm(dat, sp, train_dat, test_dat, m_train); gc()
+  uhc
+}
+
+```
+
+```{r}
+# =====================================================================
+# RUN
+# =====================================================================
+# Loop over populations so each population's big dataset is loaded once,
+# used for all of its models, then dropped from memory.
+uhc_results <- list()
+for (pop in c("etosha", "west")) {
+  pop_dat <- load_batches(if (pop == "etosha") etosha_dir else west_dir)
+  for (nm in names(model_specs)) {
+    if (model_specs[[nm]]$pop != pop) next          # only this population's models
+    uhc_results[[nm]] <- run_uhc(pop_dat, model_specs[[nm]], nm)
+  }
+  rm(pop_dat); gc()
+}
+
+# plot(uhc_results$etosha_wet["evi"])
+# plot(conf_envelope(as.data.frame(uhc_results$etosha_wet), levels = c(0.95, 1)))
+```
+
