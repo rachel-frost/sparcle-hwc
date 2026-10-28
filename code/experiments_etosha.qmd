@@ -3,74 +3,310 @@ title: "experiments_etosha"
 format: html
 editor: visual
 ---
-
-```{r}
-#load libraries 
-#| include: false
-# ----- setup -----
+#1: Set Up
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
 library(tidyverse)
-library(janitor)
 library(here)
-library(terra)
 library(amt)
 library(survival)
-library(broom)
+library(janitor)
 select <- dplyr::select
 
 here()   # checkpoint: should end in /sparcle-hwc
 ```
 
+## 1a. CONFIG (the only chunk we should need to edit for diff pops)
 ```{r}
-# ===== EXPERIMENT CONFIG =====
-# >>> CHANGE THESE when switching to precip + categorical land cover
-data_version <- "v1_1h_lcdist"
-input_file   <- here("outputs", "ele_trk_extract_etosha_1h.rds")
+# ----- population -----
+pop_label  <- "etosha"                                         # "etosha" or "west"
+input_file <- here("outputs", "ele_trk_extract_etosha_1h.rds")
+# West: input_file <- here("outputs", "ele_trk_extract_west_1h.rds")   # check the exact file name
 
-hab_terms <- c("fence_dist", "road_dist", "water_rivers_dist", "cropland_dist",
-               "grassland_dist", "shrubland_dist", "tree_cover_dist", "urban_dist",
-               "elevation", "slope", "aspect", "evi", "world_pop")
-mov_terms <- character(0)
+# ----- data version (names the output folder) -----
+data_version <- "v1_1h_lcdist"     # change when testing 6h / 12h / new covariates
 
-# extraction functions that match how input_file was built (for the 6h/12h tests)
-extract_lc_fun <- readRDS(here("outputs", "extract_lc_dist.rds"))
-# later: extract_lc_fun <- extract_lc_mixed   (after source()-ing ssf_functions.R)
-# ==============================
+# ----- base covariates -----
+# aspect dropped: ns in both seasons and BIC penalised it ~12 (Etosha, Oct 2026)
+# core_dist dropped: ~99% zeros for Etosha (elephants stay inside the park);
+#   for West the core raster has no core cells in the west extent
+base_terms <- c("fence_dist", "road_dist", "water_rivers_dist", "cropland_dist",
+                "grassland_dist", "shrubland_dist", "tree_cover_dist", "urban_dist",
+                "elevation", "slope", "evi", "world_pop")
 
-exp_dir <- here("outputs", "experiments_etosha", data_version)
+# ----- seasons -----
+wet_months <- c(11, 12, 1:4)       # Nov–Apr; everything else is dry (May–Oct)
+
+# ----- experiment settings -----
+period_split_year <- 2012          # "late" = hydro year >= this. Check both halves have elephants
+sex_file          <- here("data", paste0(pop_label, "_sex.csv"))   # columns: id, sex (F/M)
+min_used_per_id   <- 500           # per-elephant fits skip animals with fewer used steps
+
+# ----- outputs -----
+exp_dir <- here("outputs", paste0("experiments_", pop_label), data_version)
 dir.create(exp_dir, showWarnings = FALSE, recursive = TRUE)
-base_rhs <- paste(c(hab_terms, mov_terms), collapse = " + ")
+exp_dir
 ```
 
-You can add options to executable code like this
+1b: scaling set up
 
 ```{r}
-#| echo: false
-#chunk 1: load all data
-ele_trk_extract_etosha <- readRDS(input_file)
-cat("rows:", nrow(ele_trk_extract_etosha), "\n")
+# Hydrological year: Nov–Oct, labelled by the year it ENDS (Nov 2009 – Oct 2010 = HY 2010)
+hydro_year <- function(t) if_else(month(t) >= 11, year(t) + 1L, year(t))
 
-# checkpoint: every model term exists in the data
-setdiff(c(hab_terms, mov_terms), names(ele_trk_extract_etosha))   # should be character(0)
+# Keep only strata with 1 used step and >= 1 available step (after NA drops)
+keep_complete_strata <- function(d) {
+  cls <- class(d)
+  out <- d |>
+    group_by(step_id_) |>
+    filter(any(case_) & any(!case_)) |>
+    ungroup()
+  class(out) <- cls
+  out
+}
 
-complete_data <- ele_trk_extract_etosha |>
-  mutate(step_id_ = if (any(grepl("_", step_id_))) step_id_ else paste(id, step_id_, sep = "_")) |>
-  grep("hydro_year", readLines(here("code", "etosha_yearly_ssf.Rmd")), value = TRUE) |>
-  drop_na(all_of(c(hab_terms, mov_terms)))
+# Scaling: mean/sd used to standardise; min/max let the resistance script clamp rasters
+get_scaling <- function(data, vars) {
+  tibble(var  = vars,
+         mean = map_dbl(vars, ~ mean(data[[.x]], na.rm = TRUE)),
+         sd   = map_dbl(vars, ~ sd(data[[.x]],   na.rm = TRUE)),
+         min  = map_dbl(vars, ~ min(data[[.x]],  na.rm = TRUE)),
+         max  = map_dbl(vars, ~ max(data[[.x]],  na.rm = TRUE)))
+}
 
-cat("complete rows:", nrow(complete_data), "\n")
-complete_data |> count(hydro_year, season)
+apply_scaling <- function(data, sc) {
+  for (i in seq_len(nrow(sc))) {
+    data[[sc$var[i]]] <- (data[[sc$var[i]]] - sc$mean[i]) / sc$sd[i]
+  }
+  data
+}
 
-sandbox <- complete_data |> filter(hydro_year == 2015, season == "dry")
-cat("sandbox:", n_distinct(sandbox$id), "elephants,", n_distinct(sandbox$step_id_), "strata\n")
+# Fit one experiment (dry + wet). Saves coefs/SE/AIC/BIC/scaling (small files),
+# not full model objects. Returns a tidy table.
+run_experiment <- function(dry, wet, vars, label, extra_rhs = NULL, save = TRUE) {
+  f <- reformulate(c(vars, extra_rhs, "strata(step_id_)"), response = "case_")
+  environment(f) <- globalenv()   # stop the formula dragging the big data into saved files
+
+  out <- list()
+  for (ssn in c("dry", "wet")) {
+    d  <- if (ssn == "dry") dry else wet
+    sc <- get_scaling(d, vars)
+    m  <- fit_clogit(apply_scaling(d, sc), f, model = FALSE)
+    out[[ssn]] <- list(coef = coef(m$model), vcov = vcov(m$model),
+                       AIC = AIC(m$model), BIC = BIC(m$model), scaling = sc)
+    cat(label, ssn, "done\n")
+  }
+  if (save) saveRDS(out, file.path(exp_dir, paste0(label, ".rds")))
+
+  map_dfr(out, \(r) tibble(term = names(r$coef), estimate = unname(r$coef),
+                           se = sqrt(diag(r$vcov)), AIC = r$AIC, BIC = r$BIC),
+          .id = "season") |>
+    mutate(experiment = label)
+}
+
+# Interaction terms: every base covariate × a 0/1 group dummy
+int_terms <- function(dummy) paste0(base_terms, ":", dummy)
+
+# Compare base vs interaction model: AIC/BIC + which interactions matter
+compare_split <- function(base_res, int_res, dummy) {
+  aic <- bind_rows(base_res, int_res) |>
+    distinct(experiment, season, AIC, BIC) |>
+    group_by(season) |>
+    mutate(dAIC = AIC - min(AIC), dBIC = BIC - min(BIC)) |>
+    ungroup()
+  ints <- int_res |>
+    filter(str_detect(term, paste0(":", dummy, "$"))) |>
+    mutate(z = estimate / se, sig = abs(z) > 1.96) |>
+    select(season, term, estimate, se, z, sig) |>
+    arrange(season, desc(abs(z)))
+  list(aic = aic, interactions = ints)
+}
+
+# Coefficient plot for any combination of experiment results
+plot_coefs <- function(res) {
+  res |>
+    ggplot(aes(x = estimate, y = term, colour = experiment)) +
+    geom_vline(xintercept = 0, colour = "grey70") +
+    geom_pointrange(aes(xmin = estimate - 1.96 * se, xmax = estimate + 1.96 * se),
+                    position = position_dodge(width = 0.6), size = 0.2) +
+    facet_wrap(~ season) +
+    labs(x = "Scaled coefficient", y = NULL) +
+    theme_bw()
+}
+```
+
+# 2. Data prep
+```{r}
+# chunk 2: clean strata, scale, fit pooled dry + wet models
+
+ele <- readRDS(input_file)
+cls <- class(ele)                           # keep amt's class for fitting
+cat("rows:", nrow(ele), "| elephants:", n_distinct(ele$id), "\n")
+
+# Checkpoint: every covariate exists (should be character(0))
+setdiff(base_terms, names(ele))
+
+# Checkpoint: 1-hour steps (median ~60 min; ~360 for 6h data, ~720 for 12h)
+ele |> as_tibble() |> filter(case_) |>
+  summarise(median_dt_min = median(as.numeric(dt_, units = "mins"), na.rm = TRUE))
+```
+
+```{r prep}
+complete_data <- ele |>
+  mutate(
+    step_id_   = if (any(grepl("_", step_id_))) step_id_ else paste(id, step_id_, sep = "_"),
+    season     = if_else(month(t1_) %in% wet_months, "wet", "dry"),
+    hydro_year = hydro_year(t1_)
+  ) |>
+  drop_na(all_of(base_terms))
+class(complete_data) <- cls
+
+dry_data <- complete_data |> filter(season == "dry") |> keep_complete_strata()
+wet_data <- complete_data |> filter(season == "wet") |> keep_complete_strata()
+
+# Checkpoints
+cat("rows dropped for NAs:", nrow(ele) - nrow(complete_data), "\n")
+head(unique(dry_data$step_id_))   # should be elephant-prefixed, e.g. "AG006_12"
+c(dry_strata = n_distinct(dry_data$step_id_), wet_strata = n_distinct(wet_data$step_id_))
+```
+
+```{r coverage}
+# Elephants and used steps per hydro year and season (raw data overview)
+bind_rows(dry = dry_data, wet = wet_data, .id = "season") |>
+  filter(case_) |>
+  group_by(hydro_year, season) |>
+  summarise(n_elephants = n_distinct(id), n_steps = n(), .groups = "drop") |>
+  pivot_wider(names_from = season, values_from = c(n_elephants, n_steps)) |>
+  print(n = Inf)
+```
+
+```{r correlation-check}
+# Collinearity check: pairs above ~|0.6| make individual coefficients hard to read
+# (Etosha: elevation vs water_rivers_dist = 0.94; read those two together)
+cor_mat <- as_tibble(wet_data) |> select(all_of(base_terms)) |> cor(use = "complete.obs")
+round(cor_mat, 2)
+
+as_tibble(cor_mat, rownames = "var1") |>
+  pivot_longer(-var1, names_to = "var2", values_to = "r") |>
+  filter(var1 < var2, abs(r) > 0.6) |>
+  arrange(desc(abs(r)))
+```
+# 3. Base model (pooled, all years)
+
+This is the model that feeds the resistance surface. All the experiments below
+are compared against it.
+
+```{r base-model}
+res_base <- run_experiment(dry_data, wet_data, base_terms, "base")
+res_base |> print(n = Inf)
+plot_coefs(res_base)
+```
+
+##Experiments
+
+## Experiment 1: early vs late period (should we split by year?)
+
+Instead of tiny single-year fits, this compares two halves of the data that both
+have enough elephants. `late` = hydro year >= `period_split_year`.
+
+```{r exp1-period}
+add_late <- function(d) { d$late <- as.integer(d$hydro_year >= period_split_year); d }
+dry_data <- add_late(dry_data)
+wet_data <- add_late(wet_data)
+
+# Checkpoint: both periods need a reasonable number of elephants
+bind_rows(dry = dry_data, wet = wet_data, .id = "season") |>
+  filter(case_) |> distinct(season, late, id) |> count(season, late, name = "n_elephants")
+
+res_period <- run_experiment(dry_data, wet_data, base_terms, "int_period",
+                             extra_rhs = int_terms("late"))
+cmp_period <- compare_split(res_base, res_period, "late")
+cmp_period$aic
+cmp_period$interactions |> print(n = Inf)
+```
+
+
+## Experiment 2: sex (should we split by male and female?)
+
+Needs a lookup CSV at `sex_file` with columns `id` and `sex` (F/M), from the
+Movebank reference data.
+
+```{r}
+id_col <- "animal_id"
+
+sex_tbl <- ref |>
+  transmute(id = as.character(.data[[id_col]]),
+            sex = toupper(substr(animal_sex, 1, 1))) |>   # "m"/"f" -> "M"/"F"
+  filter(!is.na(sex)) |>
+  distinct()
+
+sex_tbl |> count(id) |> filter(n > 1)     # should be empty
+setdiff(track_ids, sex_tbl$id)            # should be character(0)
+
+etosha_sex <- sex_tbl |> filter(id %in% track_ids)
+etosha_sex |> count(sex)                  # how many F vs M
+write_csv(etosha_sex, here("data", "etosha_sex.csv"))
+
+write_csv(sex_tbl |> filter(!id %in% track_ids), here("data", "west_sex.csv"))
+```
+
+
+```{r exp2-sex}
+if (!file.exists(sex_file)) stop("Make the sex lookup first: ", sex_file)
+
+sex_tbl <- read_csv(sex_file, show_col_types = FALSE)
+add_sex <- function(d) {
+  out <- d |> left_join(sex_tbl, by = "id") |> mutate(male = as.integer(sex == "M"))
+  class(out) <- cls
+  out
+}
+dry_data <- add_sex(dry_data)
+wet_data <- add_sex(wet_data)
+
+# Checkpoints: every elephant matched, and enough of each sex
+setdiff(unique(dry_data$id), sex_tbl$id)        # should be character(0)
+dry_data |> filter(case_) |> distinct(id, sex) |> count(sex)
+
+res_sex_rob <- run_experiment(dry_data, wet_data, base_terms, "int_sex_robust",
+                              extra_rhs = c(int_terms("male"), "cluster(id)"))
+compare_split(res_base, res_sex_rob, "male")$interactions |> print(n = Inf)
+cmp_sex$aic
+cmp_sex$interactions |> print(n = Inf)
 ```
 
 ```{r}
-# >>> CHANGED inside run_extraction()
-reg[rows, ] |> extract_evi() |> extract_world_pop() |> extract_static() |>
-  extract_lc_fun() |> extract_linear()
+r <- readRDS(file.path(exp_dir, "int_sex.rds"))
 
-xextract_evi       <- readRDS(here("outputs", "extract_evi.rds"))
-extract_world_pop <- readRDS(here("outputs", "extract_world_pop.rds"))
-extract_static    <- readRDS(here("outputs", "extract_static.rds"))
-extract_linear    <- readRDS(here("outputs", "extract_linear.rds"))
+by_sex <- map_dfr(r, \(x) {
+  b <- x$coef; V <- x$vcov
+  map_dfr(base_terms, \(v) {
+    int <- paste0(v, ":male")
+    tibble(term = v,
+           female = b[v], female_se = sqrt(V[v, v]),
+           male   = b[v] + b[int],
+           male_se = sqrt(V[v, v] + V[int, int] + 2 * V[v, int]))
+  })
+}, .id = "season")
+
+by_sex |>
+  pivot_longer(c(female, male), names_to = "experiment", values_to = "estimate") |>
+  mutate(se = if_else(experiment == "female", female_se, male_se)) |>
+  plot_coefs()
 ```
+#Note on output: in the corellation test, water and elevation were flagged as highly correlated (~0.9) so this may not actually be showing a clear difference in behavior here. 
+
+
+```{r}
+# chunk 4: fit pooled models (a few minutes each)
+
+f_pooled <- as.formula(paste("case_ ~", base_rhs, "+ strata(step_id_)"))
+f_pooled
+
+m_dry <- dry_data |> apply_scaling(sc_dry) |> fit_clogit(f_pooled, model = FALSE)
+m_wet <- wet_data |> apply_scaling(sc_wet) |> fit_clogit(f_pooled, model = FALSE)
+
+summary(m_dry)
+summary(m_wet)
+
+```
+Core distance is removed here since it is collinear + covered majority of the etosha region. 
