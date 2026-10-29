@@ -18,20 +18,42 @@ here()   # checkpoint: should end in /sparcle-hwc
 
 ## 1a. CONFIG (the only chunk we should need to edit for diff pops)
 ```{r}
+
+use_sample  <- TRUE     # FALSE = full data (for the final resistance-surface model)
+sample_frac <- 0.2      # share of each elephant's strata kept, per season
+sample_seed <- 1
 # ----- population -----
-pop_label  <- "etosha"                                         # "etosha" or "west"
-input_file <- here("outputs", "ele_trk_extract_etosha_1h.rds")
-# West: input_file <- here("outputs", "ele_trk_extract_west_1h.rds")   # check the exact file name
+pop_label <- "etosha"              # "etosha" or "west"
+
+# ----- land-cover version -----
+# "lcmixed" (default): grassland/shrubland/tree_cover are 0/1 land-cover classes;
+#                      cropland/urban/water stay as distance-to
+# "lcdist"           : all land cover as distance-to (the v1 results)
+lc_version <- "lcmixed"
+
+# ----- input file (built by the extraction script; check the name exists in outputs/) -----
+input_file <- here("outputs", paste0("ele_trk_extract_", pop_label, "_1h_", lc_version, "_slim.rds"))
+# lcdist Etosha was saved without the suffix: here("outputs", "ele_trk_extract_etosha_1h.rds")
+file.exists(input_file)            # checkpoint: TRUE
 
 # ----- data version (names the output folder) -----
-data_version <- "v1_1h_lcdist"     # change when testing 6h / 12h / new covariates
+data_version <- paste0("1h_", lc_version,
+                       if (use_sample) paste0("_sample", sample_frac * 100) else "")  # change when testing 6h / 12h / new covariates
 
 # ----- base covariates -----
 # aspect dropped: ns in both seasons and BIC penalised it ~12 (Etosha, Oct 2026)
 # core_dist dropped: ~99% zeros for Etosha (elephants stay inside the park);
 #   for West the core raster has no core cells in the west extent
-base_terms <- c("fence_dist", "road_dist", "water_rivers_dist", "cropland_dist",
-                "grassland_dist", "shrubland_dist", "tree_cover_dist", "urban_dist",
+if (lc_version == "lcmixed") {
+  binary_terms <- c("grassland", "shrubland", "tree_cover")   # 0/1, NOT scaled
+  lc_terms     <- binary_terms
+} else {
+  binary_terms <- character(0)
+  lc_terms     <- c("grassland_dist", "shrubland_dist", "tree_cover_dist")
+}
+
+base_terms <- c("fence_dist", "road_dist", "water_rivers_dist", "cropland_dist", "urban_dist",
+                lc_terms,
                 "elevation", "slope", "evi", "world_pop")
 
 # ----- seasons -----
@@ -83,15 +105,15 @@ apply_scaling <- function(data, sc) {
 
 # Fit one experiment (dry + wet). Saves coefs/SE/AIC/BIC/scaling (small files),
 # not full model objects. Returns a tidy table.
-run_experiment <- function(dry, wet, vars, label, extra_rhs = NULL, save = TRUE) {
+run_experiment <- function(dry, wet, vars, label, extra_rhs = NULL, save = TRUE, ...) {   # >>> CHANGED: add ... 
   f <- reformulate(c(vars, extra_rhs, "strata(step_id_)"), response = "case_")
   environment(f) <- globalenv()   # stop the formula dragging the big data into saved files
 
   out <- list()
   for (ssn in c("dry", "wet")) {
     d  <- if (ssn == "dry") dry else wet
-    sc <- get_scaling(d, vars)
-    m  <- fit_clogit(apply_scaling(d, sc), f, model = FALSE)
+    sc <- get_scaling(d, setdiff(vars, binary_terms))   # 0/1 land cover stays unscaled
+           m  <- fit_clogit(apply_scaling(d, sc), f, model = FALSE, ...)                        # >>> CHANGED: pass ... through
     out[[ssn]] <- list(coef = coef(m$model), vcov = vcov(m$model),
                        AIC = AIC(m$model), BIC = BIC(m$model), scaling = sc)
     cat(label, ssn, "done\n")
@@ -136,6 +158,16 @@ plot_coefs <- function(res) {
 ```
 
 # 2. Data prep
+#is this not needed? 
+```{r combine-batches, eval = FALSE}
+# Batch folders are named like data/batch_output_<pop>_hr1_<lc_version>_<nrows>
+batch_dir   <- list.files(here("data"), pattern = paste0(pop_label, "_hr1_", lc_version),
+                          full.names = TRUE)[1]
+batch_files <- list.files(batch_dir, pattern = "pipeline_batch_.*\\.rds", full.names = TRUE)
+length(batch_files)
+```
+
+
 ```{r}
 # chunk 2: clean strata, scale, fit pooled dry + wet models
 
@@ -156,19 +188,59 @@ complete_data <- ele |>
   mutate(
     step_id_   = if (any(grepl("_", step_id_))) step_id_ else paste(id, step_id_, sep = "_"),
     season     = if_else(month(t1_) %in% wet_months, "wet", "dry"),
-    hydro_year = hydro_year(t1_)
+    hydro_year = hydro_year(t1_),
+    across(any_of(binary_terms), ~ replace_na(.x, 0))   # binary rasters are 1/NA: NA = not that class
   ) |>
   drop_na(all_of(base_terms))
 class(complete_data) <- cls
 
-dry_data <- complete_data |> filter(season == "dry") |> keep_complete_strata()
-wet_data <- complete_data |> filter(season == "wet") |> keep_complete_strata()
+dry_full <- complete_data |> filter(season == "dry") |> keep_complete_strata()
+wet_full <- complete_data |> filter(season == "wet") |> keep_complete_strata()
 
-# Checkpoints
+# Checkpoints (full data)
 cat("rows dropped for NAs:", nrow(ele) - nrow(complete_data), "\n")
-head(unique(dry_data$step_id_))   # should be elephant-prefixed, e.g. "AG006_12"
-c(dry_strata = n_distinct(dry_data$step_id_), wet_strata = n_distinct(wet_data$step_id_))
+if (length(binary_terms) > 0) {
+  print(colMeans(as_tibble(complete_data)[binary_terms]))
+  print(table(n_classes = rowSums(as_tibble(complete_data)[binary_terms])))
+}
+head(unique(dry_full$step_id_))
+
+# ----- sampling (always applied here, so prep and sample can't get out of sync) -----
+sample_strata <- function(d, frac, seed) {
+  set.seed(seed)
+  keep <- d |> as_tibble() |> distinct(id, step_id_) |>
+    group_by(id) |> slice_sample(prop = frac) |> ungroup() |> pull(step_id_)
+  out <- d |> filter(step_id_ %in% keep)
+  class(out) <- cls
+  out
+}
+
+if (use_sample) {
+  dry_data <- sample_strata(dry_full, sample_frac, sample_seed)
+  wet_data <- sample_strata(wet_full, sample_frac, sample_seed)
+} else {
+  dry_data <- dry_full
+  wet_data <- wet_full
+}
+
+# Sample size report
+size_tbl <- function(d) d |> as_tibble() |>
+  summarise(elephants = n_distinct(id), used_steps = sum(case_), rows = n())
+
+sample_sizes <- bind_rows(
+  full_dry = size_tbl(dry_full), sample_dry = size_tbl(dry_data),
+  full_wet = size_tbl(wet_full), sample_wet = size_tbl(wet_data), .id = "set") |>
+  separate(set, into = c("data", "season")) |>
+  pivot_wider(names_from = data, values_from = c(elephants, used_steps, rows)) |>
+  mutate(pct_kept = round(100 * used_steps_sample / used_steps_full, 1))
+print(sample_sizes)
+write_csv(sample_sizes, file.path(exp_dir, "sample_sizes.csv"))
+
+cat("MODEL DATA -> dry:", nrow(dry_data), "rows | wet:", nrow(wet_data), "rows\n")
+
+rm(ele, complete_data, dry_full, wet_full); gc()
 ```
+
 
 ```{r coverage}
 # Elephants and used steps per hydro year and season (raw data overview)
@@ -183,7 +255,8 @@ bind_rows(dry = dry_data, wet = wet_data, .id = "season") |>
 ```{r correlation-check}
 # Collinearity check: pairs above ~|0.6| make individual coefficients hard to read
 # (Etosha: elevation vs water_rivers_dist = 0.94; read those two together)
-cor_mat <- as_tibble(wet_data) |> select(all_of(base_terms)) |> cor(use = "complete.obs")
+cor_mat <- as_tibble(wet_data) |> select(all_of(setdiff(base_terms, binary_terms))) |>
+  cor(use = "complete.obs")
 round(cor_mat, 2)
 
 as_tibble(cor_mat, rownames = "var1") |>
@@ -202,7 +275,7 @@ res_base |> print(n = Inf)
 plot_coefs(res_base)
 ```
 
-##Experiments
+## Experiments
 
 ## Experiment 1: early vs late period (should we split by year?)
 
@@ -231,32 +304,36 @@ cmp_period$interactions |> print(n = Inf)
 Needs a lookup CSV at `sex_file` with columns `id` and `sex` (F/M), from the
 Movebank reference data.
 
-```{r}
-id_col <- "animal_id"
+```{r make-sex-lookup}
+if (!file.exists(sex_file)) {
+  ref_file <- list.files(here("data", "Elephant movements"), pattern = "reference-data",
+                         recursive = TRUE, full.names = TRUE)[1]
+  ref <- read_csv(ref_file, show_col_types = FALSE) |> clean_names()
 
-sex_tbl <- ref |>
-  transmute(id = as.character(.data[[id_col]]),
-            sex = toupper(substr(animal_sex, 1, 1))) |>   # "m"/"f" -> "M"/"F"
-  filter(!is.na(sex)) |>
-  distinct()
+  pop_ids <- unique(as.character(ele$id))          # elephants in this population's data
 
-sex_tbl |> count(id) |> filter(n > 1)     # should be empty
-setdiff(track_ids, sex_tbl$id)            # should be character(0)
+  sex_lookup <- ref |>
+    transmute(id = as.character(animal_id),
+              sex = toupper(substr(animal_sex, 1, 1))) |>   # "m"/"f" -> "M"/"F"
+    filter(!is.na(sex), id %in% pop_ids) |>
+    distinct()
 
-etosha_sex <- sex_tbl |> filter(id %in% track_ids)
-etosha_sex |> count(sex)                  # how many F vs M
-write_csv(etosha_sex, here("data", "etosha_sex.csv"))
+  print(setdiff(pop_ids, sex_lookup$id))           # should be character(0)
+  print(sex_lookup |> count(id) |> filter(n > 1))  # should be empty
+  print(sex_lookup |> count(sex))
 
-write_csv(sex_tbl |> filter(!id %in% track_ids), here("data", "west_sex.csv"))
+  write_csv(sex_lookup, sex_file)
+}
+sex_file
 ```
 
-
 ```{r exp2-sex}
-if (!file.exists(sex_file)) stop("Make the sex lookup first: ", sex_file)
-
 sex_tbl <- read_csv(sex_file, show_col_types = FALSE)
 add_sex <- function(d) {
-  out <- d |> left_join(sex_tbl, by = "id") |> mutate(male = as.integer(sex == "M"))
+  out <- d |>
+    select(-any_of(c("sex", "male"))) |>           # safe to rerun
+    left_join(sex_tbl, by = "id") |>
+    mutate(male = as.integer(sex == "M"))
   class(out) <- cls
   out
 }
@@ -267,46 +344,68 @@ wet_data <- add_sex(wet_data)
 setdiff(unique(dry_data$id), sex_tbl$id)        # should be character(0)
 dry_data |> filter(case_) |> distinct(id, sex) |> count(sex)
 
-res_sex_rob <- run_experiment(dry_data, wet_data, base_terms, "int_sex_robust",
-                              extra_rhs = c(int_terms("male"), "cluster(id)"))
-compare_split(res_base, res_sex_rob, "male")$interactions |> print(n = Inf)
+res_sex <- run_experiment(dry_data, wet_data, base_terms, "int_sex",
+                          extra_rhs = int_terms("male"))
+cmp_sex <- compare_split(res_base, res_sex, "male")
 cmp_sex$aic
 cmp_sex$interactions |> print(n = Inf)
 ```
 
-```{r}
-r <- readRDS(file.path(exp_dir, "int_sex.rds"))
+How to read it: same as Experiment 1. Each interaction is how much males differ
+from females for that effect.
 
-by_sex <- map_dfr(r, \(x) {
-  b <- x$coef; V <- x$vcov
-  map_dfr(base_terms, \(v) {
-    int <- paste0(v, ":male")
-    tibble(term = v,
-           female = b[v], female_se = sqrt(V[v, v]),
-           male   = b[v] + b[int],
-           male_se = sqrt(V[v, v] + V[int, int] + 2 * V[v, int]))
-  })
-}, .id = "season")
+```{r exp2-sex-plot}
+# Female and male effects side by side (female = main effect, male = main + interaction)
+sex_effects <- function(label, terms) {
+  r <- readRDS(file.path(exp_dir, paste0(label, ".rds")))
+  map_dfr(r, \(x) {
+    b <- x$coef; V <- x$vcov
+    map_dfr(terms, \(v) {
+      int <- paste0(v, ":male")
+      tibble(term = v,
+             female = b[v],          female_se = sqrt(V[v, v]),
+             male   = b[v] + b[int], male_se   = sqrt(V[v, v] + V[int, int] + 2 * V[v, int]))
+    })
+  }, .id = "season") |>
+    pivot_longer(c(female, male), names_to = "experiment", values_to = "estimate") |>
+    mutate(se = if_else(experiment == "female", female_se, male_se))
+}
 
-by_sex |>
-  pivot_longer(c(female, male), names_to = "experiment", values_to = "estimate") |>
-  mutate(se = if_else(experiment == "female", female_se, male_se)) |>
-  plot_coefs()
+sex_effects("int_sex", base_terms) |> plot_coefs()
+
+# Steps and elephants by sex
+bind_rows(dry = dry_data, wet = wet_data, .id = "season") |>
+  filter(case_) |>
+  group_by(season, sex) |>
+  summarise(n_elephants = n_distinct(id), n_steps = n(), .groups = "drop")
 ```
-#Note on output: in the corellation test, water and elevation were flagged as highly correlated (~0.9) so this may not actually be showing a clear difference in behavior here. 
 
+```{r exp2-sex-robust}
+# Robust SEs clustered by elephant: sex is an elephant-level trait, so plain SEs are too small.
+# method = "approximate" is required for robust SEs; with 1 used step per stratum it gives
+# the same coefficients as the default exact method.
+res_sex_rob <- run_experiment(dry_data, wet_data, base_terms, "int_sex_robust",
+                              extra_rhs = c(int_terms("male"), "cluster(id)"),
+                              method = "approximate")
 
-```{r}
-# chunk 4: fit pooled models (a few minutes each)
+rob <- compare_split(res_base, res_sex_rob, "male")$interactions
+rob |> print(n = Inf)
 
-f_pooled <- as.formula(paste("case_ ~", base_rhs, "+ strata(step_id_)"))
-f_pooled
-
-m_dry <- dry_data |> apply_scaling(sc_dry) |> fit_clogit(f_pooled, model = FALSE)
-m_wet <- wet_data |> apply_scaling(sc_wet) |> fit_clogit(f_pooled, model = FALSE)
-
-summary(m_dry)
-summary(m_wet)
-
+# Side by side: which sex differences survive clustering?
+cmp_sex$interactions |>
+  select(season, term, z_plain = z) |>
+  left_join(rob |> select(season, term, z_robust = z, sig_robust = sig), by = c("season", "term")) |>
+  arrange(season, desc(abs(z_robust)))
 ```
-Core distance is removed here since it is collinear + covered majority of the etosha region. 
+
+```{r exp2-sex-elevonly}
+# Elevation and water are r = 0.94 in Etosha, so their sex interactions trade off.
+# Refit with elevation only to get an interpretable sex difference on that axis.
+elev_terms <- setdiff(base_terms, "water_rivers_dist")
+res_base_elev <- run_experiment(dry_data, wet_data, elev_terms, "base_elevonly")
+res_sex_elev  <- run_experiment(dry_data, wet_data, elev_terms, "int_sex_elevonly",
+                                extra_rhs = paste0(elev_terms, ":male"))
+compare_split(res_base_elev, res_sex_elev, "male")$aic
+sex_effects("int_sex_elevonly", elev_terms) |> plot_coefs()
+```
+
