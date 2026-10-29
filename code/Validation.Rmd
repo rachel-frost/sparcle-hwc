@@ -74,7 +74,7 @@ load_batches <- function(dir) {
 # --------------------------------------------------------------------- 
 # add transform 
 # ---------------------------------------------------------------------
-# Not in the vignette: a hook for transformed covariates (sin/cos of aspect, log of population, etc.). It currently does nothing. If you add a transformed variable here, use it in BOTH the SSF and the UHC so the two stay in sync.
+# Not in the workflow: a hook for transformed covariates (sin/cos of aspect, log of population, etc.). It currently does nothing. If there is a transformed variable here, use it in BOTH the SSF and the UHC so the two stay in sync.
 # right now there are only raw variables in the model. If we see in the plots that the black falls outside the envelope for aspect, world_pop, or distance variable, that is a problem. 
 add_transforms <- function(dat) {
   dat |> mutate(
