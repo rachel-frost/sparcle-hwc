@@ -237,3 +237,219 @@ for (pop in c("etosha", "west")) {
 # plot(conf_envelope(as.data.frame(uhc_results$etosha_wet), levels = c(0.95, 1)))
 ```
 
+#===============================
+#Boyce Cross-Validation 
+#===============================
+
+```{r}
+# =============================================================================
+# CONTINUOUS BOYCE INDEX VALIDATION FOR Etosha and Western 
+# =============================================================================
+
+
+#0. Packages
+library(tidyverse)
+library(survival)   # clogit()
+library(modEvA)     # Boyce()
+library(here)
+
+set.seed(123)       # fold assignment is random
+
+
+#1. Load the extracted step data 
+etosha_all <- readRDS(here("outputs", "ele_trk_extract_etosha.rds"))
+west_all   <- readRDS(here("outputs", "ele_trk_extract_west.rds"))
+
+
+#2. Choose covariates and settings
+vars_west   <- c("core_dist", "fence_dist", "road_dist", "water_rivers_dist",
+                 "cropland_dist", "grassland", "shrubland", "urban_dist",
+                 "tree_cover", "elevation", "slope", "aspect", "evi", "world_pop")
+
+#Etosha dropped core_dist because most Etosha steps are inside the core area.
+vars_etosha <- setdiff(vars_west, "core_dist")
+
+k_folds      <- 5     #number of CV folds (capped at the number of elephants)
+bin_width    <- 0.1   #moving-window width, in units of the prediction scale
+n_windows    <- 100   #number of window positions along the gradient (modEvA `res`)
+pred_scale   <- "rank"  # "rank" or "lp" -- see section 5 for the decision
+
+
+#3.Prepare a season-specific dataset 
+prep_data <- function(trk, season_label, vars, fill_lc_na = FALSE) {
+
+  d <- trk |>
+    as_tibble() |>                       # drop the amt track class; plain tibble is safer
+    filter(season == season_label)
+
+  # In Etosha pipeline set missing binary land cover to 0 (pixels outside the land-cover raster). Keep that here.
+  if (fill_lc_na) {
+    d <- d |> mutate(across(c(grassland, shrubland, tree_cover), ~ replace_na(.x, 0)))
+  }
+
+  d |>
+    # The same complete rows must be used to fit and to score, so drop NAs
+    # in any model covariate up front.
+    drop_na(all_of(vars)) |>
+    # Dropping rows can orphan a stratum (case removed but controls kept, or
+    # vice versa). A stratum needs >= 1 case and >= 1 control to be informative.
+    group_by(step_id_) |>
+    filter(any(case_), any(!case_)) |>
+    ungroup()
+}
+
+
+#4.Assign whole elephants to folds
+make_folds <- function(data, k) {
+  ids <- unique(data$id)
+  k   <- min(k, length(ids))             #can't have more folds than animals
+  fold_tbl <- tibble(id = sample(ids),   #shuffle animals, then deal into folds
+                     fold = rep_len(seq_len(k), length(ids)))
+  left_join(data, fold_tbl, by = "id")
+}
+
+
+#Fit the SSF and score new steps
+fit_ssf <- function(train, vars) {
+  f <- reformulate(c(vars, "strata(step_id_)"), response = "case_")
+  # With one used step per stratum, method = "efron" gives the same estimates
+  # as clogit's default "exact", but is much faster on millions of rows.
+  clogit(f, data = train, method = "efron")
+}
+
+# Linear predictor for new data: X %*% beta (log relative selection strength).
+score_steps <- function(fit, newdata) {
+  b <- coef(fit)
+  b <- b[!is.na(b)]
+  X <- as.matrix(newdata[, names(b)])
+  drop(X %*% b)
+}
+
+
+#6.Cross-validated Boyce for one model
+run_ssf_boyce <- function(data, vars, label, k = k_folds) {
+
+  data  <- make_folds(data, k)
+  folds <- sort(unique(data$fold))
+  oof   <- list()   #out-of-fold predictions, kept for the pooled plot
+  res   <- list()   #one row of summary stats per fold
+
+  for (f in folds) {
+    message(label, ": fold ", f, " of ", length(folds))
+
+    train <- filter(data, fold != f)
+    test  <- filter(data, fold == f)
+
+    fit <- fit_ssf(train, vars)
+    test$lp <- score_steps(fit, test)      # log-RSS of every held-out step
+
+
+    #Scale is "rank": Converts the linear predictor into a uniform percentile rank from 0 to 1. Every window gets a roughly equal number of data points, making the P/E ratio stable across the gradient. Boyce is rank-based anyway (Spearman).
+    test$pred <- if (pred_scale == "rank") percent_rank(test$lp) else test$lp
+
+    #`obs` must be numeric 0/1 (1 = used step, 0 = random step).
+    #modEvA compares predictions at used steps against predictions across
+    #ALL steps, i.e. presence vs "available".
+    b <- Boyce(obs = as.numeric(test$case_),
+               pred = test$pred,
+               n.bins = NA,                # NA = continuous moving window
+               bin.width = if (pred_scale == "rank") bin_width else "default",
+               res = n_windows,
+               method = "spearman",
+               rm.dup.classes = FALSE,
+               plot = FALSE)
+
+    res[[f]] <- tibble(
+      label = label, fold = f,
+      n_elephants = n_distinct(test$id),
+      n_used_steps = sum(test$case_),
+      boyce = b$B,
+      #modEvA flags windows with < 30 points (their P/E ratio is noisy)
+      n_small_bins = sum(b$bins$bin.N < 30, na.rm = TRUE)
+    )
+    oof[[f]] <- test |> select(step_id_, case_, lp, pred, fold)
+  }
+
+  oof <- bind_rows(oof)
+
+  #Pooled out-of-fold P/E curve
+  # A good model gives a monotonically increasing curve. Pooling predictions across folds gives one curve per model.
+  Boyce(obs = as.numeric(oof$case_), pred = oof$pred,
+        bin.width = if (pred_scale == "rank") bin_width else "default",
+        res = n_windows, plot = TRUE,
+        main = paste("Boyce (out-of-fold):", label))
+
+  #Check: within-stratum rank of the used step 
+  # Because an SSF compares each used step to ITS OWN random steps, also ask:
+  # where does the used step rank among the steps in its stratum?
+  # (Fortin et al. 2009-style). If the model works, used steps should land at
+  # the high ranks far more often than the 1/n expected by chance.
+  #strata_check <- oof |>
+    #group_by(step_id_) |>
+    #filter(n() == max(table(oof$step_id_))) |>     # keep complete strata (e.g. 11 steps)
+    #mutate(rank_in_stratum = rank(lp, ties.method = "first")) |>  # 1 = lowest score
+    #ungroup() |>
+    #filter(case_) |>
+    #count(rank_in_stratum, name = "n_used")
+
+  #within_stratum_rho <- cor(strata_check$rank_in_stratum, strata_check$n_used,
+                            #method = "spearman")
+
+ # list(label = label,
+       #folds = bind_rows(res),
+       #oof = oof,
+      # within_stratum_counts = strata_check,
+       #within_stratum_rho = within_stratum_rho)
+}
+
+
+#7. Run for each population x season 
+datasets <- list(
+  "Etosha wet" = list(d = prep_data(etosha_all, "wet", vars_etosha, fill_lc_na = TRUE), v = vars_etosha),
+  "Etosha dry" = list(d = prep_data(etosha_all, "dry", vars_etosha, fill_lc_na = TRUE), v = vars_etosha),
+  "West wet"   = list(d = prep_data(west_all,   "wet", vars_west),                      v = vars_west),
+  "West dry"   = list(d = prep_data(west_all,   "dry", vars_west),                      v = vars_west)
+)
+
+boyce_results <- imap(datasets, ~ run_ssf_boyce(.x$d, .x$v, label = .y))
+
+
+# ----- 8. Summarise -----------------------------------------------------------
+# Per-fold Boyce, then mean and SD across folds for each model.
+fold_table <- map_dfr(boyce_results, "folds")
+fold_table
+
+summary_table <- fold_table |>
+  group_by(label) |>
+  summarise(mean_boyce = mean(boyce),
+            sd_boyce   = sd(boyce),
+            min_boyce  = min(boyce),
+            max_boyce  = max(boyce),
+            .groups = "drop") |>
+  left_join(tibble(label = names(boyce_results),
+                   within_stratum_rho = map_dbl(boyce_results, "within_stratum_rho")),
+            by = "label")
+summary_table
+
+#Frequency of used steps at each within-stratum rank (should climb toward the top rank)
+map(boyce_results, "within_stratum_counts")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
