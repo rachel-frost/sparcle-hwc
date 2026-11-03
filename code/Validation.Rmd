@@ -414,7 +414,7 @@ datasets <- list(
 boyce_results <- imap(datasets, ~ run_ssf_boyce(.x$d, .x$v, label = .y))
 
 
-# ----- 8. Summarise -----------------------------------------------------------
+#8. Summarise 
 # Per-fold Boyce, then mean and SD across folds for each model.
 fold_table <- map_dfr(boyce_results, "folds")
 fold_table
