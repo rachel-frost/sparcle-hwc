@@ -4,9 +4,9 @@ author: "Marissa Brenner"
 date: "2026-10-15"
 output: html_document
 ---
-#===============================
-#Used-Habitat Calibration 
-#===============================
+#======================================
+#Used-Habitat Calibration Etosha/West 
+#======================================
 
 ```{r}
 # =====================================================================
@@ -237,6 +237,9 @@ for (pop in c("etosha", "west")) {
 # plot(conf_envelope(as.data.frame(uhc_results$etosha_wet), levels = c(0.95, 1)))
 ```
 
+
+
+
 #===============================
 #Boyce Cross-Validation 
 #===============================
@@ -433,6 +436,11 @@ summary_table
 
 #Frequency of used steps at each within-stratum rank (should climb toward the top rank)
 map(boyce_results, "within_stratum_counts")
+```
+```{r}
+names(etosha_all)
+setdiff(vars_etosha, names(etosha_all))   # every covariate the model expects but the data lacks
+setdiff(vars_west,   names(west_all))     # should be character(0)
 ```
 
 
