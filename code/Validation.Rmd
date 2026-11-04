@@ -304,11 +304,11 @@ pops <- list(
   West   = list(trk = west_all,   extra = "core_dist",  fill_lc_na = FALSE)
 )
 
-k_folds      <- 5     #number of CV folds (capped at the number of elephants)
-bin_width    <- 0.1   #moving-window width, in units of the prediction scale
-n_windows    <- 100   #number of window positions along the gradient (modEvA `res`)
-pred_scale   <- "rank"  # "rank" or "lp" -- see section 5 for the decision
-n_per_stratum <- 11   # NEW: 1 used + 10 random steps
+k_folds <- 5     #number of CV folds (capped at the number of elephants)
+bin_width <- 0.1   #moving-window width, in units of the prediction scale
+n_windows <- 100   #number of window positions along the gradient (modEvA `res`)
+pred_scale <- "rank"  # "rank" or "lp" -- see section 5 for the decision
+n_per_stratum <- 11   # 1 used + 10 random steps
 
 boyce_dir <- here("outputs", "boyce")   # NEW: per-model cache folder
 dir.create(boyce_dir, showWarnings = FALSE)
@@ -433,7 +433,7 @@ run_ssf_boyce <- function(data, vars, label, meta) {
   strata_check <- oof |>
     group_by(step_id_) |>
     filter(n() == n_per_stratum) |>                # keep complete strata (e.g. 11 steps)
-    mutate(rank_in_stratum = rank(lp, ties.method = "random")) 
+    mutate(rank_in_stratum = rank(lp, ties.method = "random")) #method for ranking steps. So when there are steps of identical score, this tie is shuffles them so that they are equally likely to land at any position in it rather than "first" which ranks whichever step comes first which is always the used which gets ranked lowest everytime then.  
     ungroup() |>
     filter(case_) |>
     count(rank_in_stratum, name = "n_used") |>
