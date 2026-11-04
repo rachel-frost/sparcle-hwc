@@ -260,26 +260,64 @@ set.seed(123)       # fold assignment is random
 
 
 #1. Load the extracted step data 
-etosha_all <- readRDS(here("outputs", "ele_trk_extract_etosha.rds"))
+# NEW: Etosha now comes from the linear-feature script (hr1, lcmixed, crossings already built).
+# West must be rerun through extract_lc_mixed() so it has grassland/shrubland/tree_cover.
+etosha_all <- readRDS(here("outputs", "ele_trk_extract_etosha_linecross.rds"))
 west_all   <- readRDS(here("outputs", "ele_trk_extract_west.rds"))
+
+# NEW: crossing indicators (same logic as the linear-feature script; harmless to re-run on Etosha)
+add_crossings <- function(d) {
+  lin_cols <- c("kaza_vet_fences_linear", "roads_linear", "hydrorivers_linear")
+  stopifnot(all(lin_cols %in% names(d)))
+  d |>
+    as_tibble() |>
+    mutate(
+      across(all_of(lin_cols), ~ if_else(is.infinite(.x) | is.na(.x), 0, .x)),  # -Inf/NA = no feature
+      fence_cross = as.integer(kaza_vet_fences_linear > 0),
+      road_cross  = as.integer(roads_linear > 0),
+      river_cross = as.integer(hydrorivers_linear > 0)
+    )
+}
+etosha_all <- add_crossings(etosha_all)
+west_all   <- add_crossings(west_all)
 
 
 #2. Choose covariates and settings
-vars_west   <- c("core_dist", "fence_dist", "road_dist", "water_rivers_dist",
-                 "cropland_dist", "grassland", "shrubland", "urban_dist",
-                 "tree_cover", "elevation", "slope", "aspect", "evi", "world_pop")
+# NEW: base_vars = everything except core_dist; cross_vars = crossing indicators
+base_vars  <- c("fence_dist", "road_dist", "water_rivers_dist",
+                "cropland_dist", "grassland", "shrubland", "urban_dist",
+                "tree_cover", "elevation", "slope", "aspect", "evi", "world_pop")
+cross_vars <- c("fence_cross", "road_cross", "river_cross")
 
 #Etosha dropped core_dist because most Etosha steps are inside the core area.
-vars_etosha <- setdiff(vars_west, "core_dist")
+# NEW: West adds core_dist back via `extra`; the three linear-feature scenarios are built from it
+make_scenarios <- function(extra = character(0)) {
+  list(
+    dist_only       = c(extra, base_vars),                                   # 1. distance-to only
+    dist_plus_cross = c(extra, base_vars, cross_vars),                       # 2. distance-to + crossings
+    cross_only      = c(extra, setdiff(base_vars, c("fence_dist", "road_dist")), cross_vars)  # 3. crossings replace fence/road distance
+  )
+}
+
+pops <- list(
+  Etosha = list(trk = etosha_all, extra = character(0), fill_lc_na = TRUE),
+  West   = list(trk = west_all,   extra = "core_dist",  fill_lc_na = FALSE)
+)
 
 k_folds      <- 5     #number of CV folds (capped at the number of elephants)
 bin_width    <- 0.1   #moving-window width, in units of the prediction scale
 n_windows    <- 100   #number of window positions along the gradient (modEvA `res`)
 pred_scale   <- "rank"  # "rank" or "lp" -- see section 5 for the decision
+n_per_stratum <- 11   # NEW: 1 used + 10 random steps
+
+boyce_dir <- here("outputs", "boyce")   # NEW: per-model cache folder
+dir.create(boyce_dir, showWarnings = FALSE)
 
 
 #3.Prepare a season-specific dataset 
 prep_data <- function(trk, season_label, vars, fill_lc_na = FALSE) {
+
+  stopifnot(all(vars %in% names(trk)))   # NEW: fails loudly if columns are missing (e.g. West without lcmixed)
 
   d <- trk |>
     as_tibble() |>                       # drop the amt track class; plain tibble is safer
@@ -291,8 +329,8 @@ prep_data <- function(trk, season_label, vars, fill_lc_na = FALSE) {
   }
 
   d |>
-    # The same complete rows must be used to fit and to score, so drop NAs
-    # in any model covariate up front.
+    #The same complete rows must be used to fit and to score, so drop NAs in any model covariate up front.
+    # NEW: `vars` is the union across all scenarios so every scenario uses identical rows.
     drop_na(all_of(vars)) |>
     # Dropping rows can orphan a stratum (case removed but controls kept, or
     # vice versa). A stratum needs >= 1 case and >= 1 control to be informative.
@@ -303,6 +341,7 @@ prep_data <- function(trk, season_label, vars, fill_lc_na = FALSE) {
 
 
 #4.Assign whole elephants to folds
+# NEW: now called once per population x season (outside run_ssf_boyce) so all scenarios share folds
 make_folds <- function(data, k) {
   ids <- unique(data$id)
   k   <- min(k, length(ids))             #can't have more folds than animals
@@ -330,9 +369,9 @@ score_steps <- function(fit, newdata) {
 
 
 #6.Cross-validated Boyce for one model
-run_ssf_boyce <- function(data, vars, label, k = k_folds) {
+# NEW: `data` already has a fold column; `meta` carries population/season/scenario labels
+run_ssf_boyce <- function(data, vars, label, meta) {
 
-  data  <- make_folds(data, k)
   folds <- sort(unique(data$fold))
   oof   <- list()   #out-of-fold predictions, kept for the pooled plot
   res   <- list()   #one row of summary stats per fold
@@ -363,6 +402,7 @@ run_ssf_boyce <- function(data, vars, label, k = k_folds) {
                plot = FALSE)
 
     res[[f]] <- tibble(
+      meta,                                # NEW: population / season / scenario
       label = label, fold = f,
       n_elephants = n_distinct(test$id),
       n_used_steps = sum(test$case_),
@@ -371,6 +411,7 @@ run_ssf_boyce <- function(data, vars, label, k = k_folds) {
       n_small_bins = sum(b$bins$bin.N < 30, na.rm = TRUE)
     )
     oof[[f]] <- test |> select(step_id_, case_, lp, pred, fold)
+    rm(train, test, fit); gc()             # NEW: free memory between folds
   }
 
   oof <- bind_rows(oof)
@@ -387,34 +428,57 @@ run_ssf_boyce <- function(data, vars, label, k = k_folds) {
   # where does the used step rank among the steps in its stratum?
   # (Fortin et al. 2009-style). If the model works, used steps should land at
   # the high ranks far more often than the 1/n expected by chance.
-  #strata_check <- oof |>
-    #group_by(step_id_) |>
-    #filter(n() == max(table(oof$step_id_))) |>     # keep complete strata (e.g. 11 steps)
-    #mutate(rank_in_stratum = rank(lp, ties.method = "first")) |>  # 1 = lowest score
-    #ungroup() |>
-    #filter(case_) |>
-    #count(rank_in_stratum, name = "n_used")
+  # NEW: uncommented, and n_per_stratum replaces the max(table(...)) lookup (slow on millions of rows);
+  # complete() fills ranks with zero counts so the correlation is always over 1:11
+  strata_check <- oof |>
+    group_by(step_id_) |>
+    filter(n() == n_per_stratum) |>                # keep complete strata (e.g. 11 steps)
+    mutate(rank_in_stratum = rank(lp, ties.method = "random")) 
+    ungroup() |>
+    filter(case_) |>
+    count(rank_in_stratum, name = "n_used") |>
+    complete(rank_in_stratum = 1:n_per_stratum, fill = list(n_used = 0))
 
-  #within_stratum_rho <- cor(strata_check$rank_in_stratum, strata_check$n_used,
-                            #method = "spearman")
+  within_stratum_rho <- cor(strata_check$rank_in_stratum, strata_check$n_used,
+                            method = "spearman")
 
- # list(label = label,
-       #folds = bind_rows(res),
-       #oof = oof,
-      # within_stratum_counts = strata_check,
-       #within_stratum_rho = within_stratum_rho)
+  list(label = label,
+       folds = bind_rows(res),
+       oof = oof,
+       within_stratum_counts = strata_check,
+       within_stratum_rho = within_stratum_rho)
 }
 
 
 #7. Run for each population x season 
-datasets <- list(
-  "Etosha wet" = list(d = prep_data(etosha_all, "wet", vars_etosha, fill_lc_na = TRUE), v = vars_etosha),
-  "Etosha dry" = list(d = prep_data(etosha_all, "dry", vars_etosha, fill_lc_na = TRUE), v = vars_etosha),
-  "West wet"   = list(d = prep_data(west_all,   "wet", vars_west),                      v = vars_west),
-  "West dry"   = list(d = prep_data(west_all,   "dry", vars_west),                      v = vars_west)
-)
+# NEW: also x scenario; each result is cached so reruns skip finished models
+boyce_results <- list()
 
-boyce_results <- imap(datasets, ~ run_ssf_boyce(.x$d, .x$v, label = .y))
+for (pop in names(pops)) {
+  scn      <- make_scenarios(pops[[pop]]$extra)
+  all_vars <- unique(unlist(scn))
+
+  for (szn in c("wet", "dry")) {
+    d <- prep_data(pops[[pop]]$trk, szn, all_vars, fill_lc_na = pops[[pop]]$fill_lc_na)
+
+    set.seed(123)                      # NEW: same fold assignment for every scenario
+    d <- make_folds(d, k_folds)
+
+    for (sc in names(scn)) {
+      label <- paste(pop, szn, sc)
+      path  <- file.path(boyce_dir, paste0(gsub(" ", "_", label), ".rds"))
+
+      if (file.exists(path)) {
+        boyce_results[[label]] <- readRDS(path)
+      } else {
+        meta <- tibble(population = pop, season = szn, scenario = sc)
+        boyce_results[[label]] <- run_ssf_boyce(d, scn[[sc]], label, meta)
+        saveRDS(boyce_results[[label]], path)
+      }
+    }
+    rm(d); gc()
+  }
+}
 
 
 #8. Summarise 
@@ -423,15 +487,16 @@ fold_table <- map_dfr(boyce_results, "folds")
 fold_table
 
 summary_table <- fold_table |>
-  group_by(label) |>
+  group_by(population, season, scenario) |>
   summarise(mean_boyce = mean(boyce),
             sd_boyce   = sd(boyce),
             min_boyce  = min(boyce),
             max_boyce  = max(boyce),
             .groups = "drop") |>
   left_join(tibble(label = names(boyce_results),
-                   within_stratum_rho = map_dbl(boyce_results, "within_stratum_rho")),
-            by = "label")
+                   within_stratum_rho = map_dbl(boyce_results, "within_stratum_rho")) |>
+              separate(label, c("population", "season", "scenario"), sep = " ", extra = "merge"),
+            by = c("population", "season", "scenario"))
 summary_table
 
 #Frequency of used steps at each within-stratum rank (should climb toward the top rank)
@@ -443,10 +508,44 @@ setdiff(vars_etosha, names(etosha_all))   # every covariate the model expects bu
 setdiff(vars_west,   names(west_all))     # should be character(0)
 ```
 
+```{r}
+set.seed(123)
+rho_fixed <- map_dfr(boyce_results, function(r) {
+  sc <- r$oof |>
+    group_by(step_id_) |>
+    filter(n() == 11) |>
+    mutate(rank_in_stratum = rank(lp, ties.method = "random")) |>
+    ungroup() |>
+    filter(case_) |>
+    count(rank_in_stratum, name = "n_used") |>
+    complete(rank_in_stratum = 1:11, fill = list(n_used = 0))
+  tibble(label = r$label,
+         rho = cor(sc$rank_in_stratum, sc$n_used, method = "spearman"))
+})
+rho_fixed
+```
 
+```{r}
+x <- boyce_results[["Etosha dry dist_only"]]$oof |>
+  group_by(step_id_) |>
+  summarise(n_unique = n_distinct(lp), .groups = "drop")
 
+mean(x$n_unique == 1)   # share of strata where all 11 steps score identically
+mean(x$n_unique < 11)   # share of strata with at least one tie
+```
 
+6.2e-05: only about 0.006% of strata have all 11 steps scoring identically. Almost every stratum has some variation for the model to use.
+0.943: about 94% of strata have at least one tie among their 11 steps. Ties are everywhere, but mostly partial, such as two or three steps sharing a pixel.
 
+```{r}
+summary_table |>
+  mutate(label = paste(population, season, scenario)) |>
+  select(label, within_stratum_rho) |>
+  left_join(rho_fixed, by = "label") |>
+  rename(rho_first = within_stratum_rho, rho_random = rho)
+```
+
+The within-stratum result looks better than the Boyce result. That fits the idea that the SSF discriminates well within strata, while the pooled, cross-elephant Boyce is noisy because of variation between individuals.
 
 
 
