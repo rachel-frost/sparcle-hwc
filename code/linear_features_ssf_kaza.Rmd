@@ -1,0 +1,437 @@
+---
+title: "linear_features_ssf_kaza"
+author: "Rachel Frost"
+date: "2026-11-05"
+output: html_document
+---
+
+Adds fence, road, and river crossing indicators to the KAZA seasonal SSF (no movement
+terms, per team decision Nov 1 2026), with the same tests as the Etosha and West scripts:
+
+1. step-length robustness check (refit with `sl_ + log_sl_`)
+2. three scenarios: distance-to only / distance-to + crossings / crossings replace distance-to
+3. how every coefficient shifts when crossings or step length are added
+
+Starts from the saved 1-hr KAZA extractions (`ele_trk_extract_kaza_wet.rds`,
+`ele_trk_extract_kaza_dry.rds`), which already have the `_linear` columns from
+`extract_linear()`, so no re-extraction is needed for crossings.
+
+Differences from the West script:
+
+- KAZA comes as two seasonal files, so each season is prepped and fit separately (never bound
+  together, which saves memory).
+- KAZA's land cover has not had the Oct 21 `extract_lc_mixed()` rerun yet. `lc_mode` picks
+  binary land cover if present and otherwise falls back to the `_dist` versions. Results with
+  `_dist` land cover are fine for the crossing questions but their habitat terms are not
+  directly comparable to Etosha/West.
+- River crossings are included: KAZA's rivers are perennial and inside the river layer's
+  extent (all steps 20.0–25.0°E; layer runs to 25.5°E).
+- Crossing terms with too few used crossings are dropped automatically (`min_used_cross`).
+- Fits are cached with a signature (formulas + row counts); if you change settings, the cache
+  is detected as stale and refit instead of silently reloaded.
+
+```{r setup}
+library(tidyverse)
+library(here)
+library(amt)
+library(survival)
+select <- dplyr::select
+```
+
+## 0. Settings
+
+```{r settings}
+lc_mode        <- "auto"   # "auto" (binary if present, else _dist), "binary", or "dist"
+drop_water     <- FALSE    # TRUE also drops water_rivers_dist in scenario 3
+min_used_cross <- 30       # crossing terms with fewer used crossings in either season are dropped
+```
+
+## 0b. Optional: test whether the binary land cover rasters cover KAZA
+
+Run this once before deciding on `extract_lc_mixed()` for KAZA. If the binary layers were
+clipped to Namibia's western/central extent, many KAZA endpoints come back NA. Not evaluated
+when knitting.
+
+```{r}
+for (s in c("wet", "dry")) {
+  out <- here("outputs", paste0("ele_trk_extract_kaza_", s, "_lcmixed.rds"))
+  if (file.exists(out)) { cat(s, "already done\n"); next }
+
+  d  <- readRDS(here("outputs", paste0("ele_trk_extract_kaza_", s, ".rds")))
+  n0 <- nrow(d)
+
+  d <- d |>
+    select(-any_of(c("cropland_dist", "urban_dist", "water_rivers_dist"))) |>  # re-extracted (identical)
+    extract_lc_mixed()
+
+  stopifnot(nrow(d) == n0)                                                      # no rows lost
+  cat(s, "rows:", nrow(d), "| binary NAs:",
+      colSums(is.na(d[, c("grassland", "shrubland", "tree_cover")])), "\n")
+  saveRDS(d, out)
+  rm(d); gc()
+}
+```
+
+
+```{r lc-coverage-test, eval = FALSE}
+kaza_test <- readRDS(here("outputs", "ele_trk_extract_kaza_wet.rds")) |> slice_sample(n = 5000)
+kaza_test <- extract_lc_mixed(kaza_test)   # same call as the Etosha/West pipeline
+colSums(is.na(kaza_test[, c("grassland", "shrubland", "tree_cover")]))   # should be ~0
+range(kaza_test$x2_); range(kaza_test$y2_)
+rm(kaza_test); gc()
+```
+
+## 1. Load extracted steps
+
+```{r load}
+kaza_files <- c(wet = "ele_trk_extract_kaza_wet_lcmixed.rds",
+                dry = "ele_trk_extract_kaza_dry_lcmixed.rds")
+
+kaza_raw <- imap(kaza_files, ~ readRDS(here("outputs", .x)) |> mutate(season = .y))
+map_int(kaza_raw, nrow)   # wet: 4,968,821
+```
+
+## 2. Checks before prep
+
+Every line here should pass before fitting anything.
+
+```{r checks}
+# --- 1-hr steps, step lengths, extent ---
+check_season <- function(d, s) {
+  obs <- d |> filter(case_)
+  dt  <- as.numeric(difftime(obs$t2_, obs$t1_, units = "mins"))
+  tibble(season = s, rows = nrow(d), used = nrow(obs),
+         median_dt_min = median(dt, na.rm = TRUE),
+         pct_dt_45_75  = mean(between(dt, 45, 75), na.rm = TRUE),   # should be near 1
+         sl_na = sum(is.na(d$sl_)), sl_le0 = sum(d$sl_ <= 0, na.rm = TRUE),
+         sl_median = median(d$sl_, na.rm = TRUE),   # < ~0.1 = degrees; hundreds = meters
+         x2_min = min(d$x2_, na.rm = TRUE), x2_max = max(d$x2_, na.rm = TRUE))
+}
+imap_dfr(kaza_raw, check_season)
+
+# --- columns ---
+lin_cols  <- c("kaza_vet_fences_linear", "roads_linear", "hydrorivers_linear")
+dist_lin  <- c("fence_dist", "road_dist", "water_rivers_dist")
+hab_terms <- c("cropland_dist", "urban_dist", "elevation", "slope", "aspect", "evi", "world_pop")
+lc_binary <- c("grassland", "shrubland", "tree_cover")
+lc_dist   <- paste0(lc_binary, "_dist")
+
+nm <- Reduce(intersect, map(kaza_raw, names))   # columns present in BOTH seasons
+
+lc_terms <- switch(lc_mode,
+                   binary = lc_binary,
+                   dist   = lc_dist,
+                   auto   = if (all(lc_binary %in% nm)) lc_binary else lc_dist)
+cat("Land cover terms:", lc_terms, "\n")
+if (identical(lc_terms, lc_dist)) {
+  message("Using distance-to land cover (no extract_lc_mixed() rerun yet). ",
+          "Crossing results are fine; habitat terms are not directly comparable to Etosha/West.")
+}
+
+needed  <- c("id", "step_id_", "case_", "sl_", "t1_", "t2_",
+             lin_cols, dist_lin, hab_terms, lc_terms)
+missing <- setdiff(needed, nm)
+if (length(missing)) stop("Missing columns: ", paste(missing, collapse = ", "))
+
+# --- step IDs: already prefixed with the elephant id? ---
+map(kaza_raw, ~ head(.x$step_id_))
+
+# --- NAs in land cover (binary NAs are about to become 0 = "not this class") ---
+map(kaza_raw, ~ colSums(is.na(.x[, lc_terms])))
+```
+
+## 3. Prep: step IDs, crossing indicators, land cover NAs
+
+Crossing columns come from `extract_linear()`: the max of each 500m line raster along the
+step, so "crossed" = the step passed through a cell containing the feature. The river layer is
+binary (1 = mapped river cell; mean discharge ≥ 10 m³/s).
+
+```{r prep}
+prep_season <- function(d) {
+  # only prefix step_id_ if it isn't already unique across elephants
+  prefixed <- all(str_starts(as.character(d$step_id_), paste0(d$id, "_")))
+
+  d <- d |>
+    mutate(
+      step_id_ = if (prefixed) as.character(step_id_) else paste(id, step_id_, sep = "_"),
+      across(all_of(lin_cols), ~ replace(.x, is.infinite(.x) | is.na(.x), 0)),  # -Inf/NA = no feature (works for int or double)
+      fence_cross = as.integer(kaza_vet_fences_linear > 0),
+      road_cross  = as.integer(roads_linear > 0),
+      river_cross = as.integer(hydrorivers_linear > 0)    # 1 = mapped river cell
+    ) |>
+    filter(!is.na(sl_), sl_ > 0)                          # log_sl_ must be finite
+
+  if (identical(lc_terms, lc_binary)) {
+    d <- d |> mutate(across(all_of(lc_binary), ~ replace_na(.x, 0)))
+  }
+  d
+}
+
+kaza <- map(kaza_raw, prep_season)
+rm(kaza_raw); gc()
+
+# checkpoint: strata intact (each step_id_ has exactly 1 used step)
+iwalk(kaza, function(d, s) {
+  sc <- d |> group_by(step_id_) |> summarise(n_case = sum(case_), n = n(), .groups = "drop")
+  cat("\n", s, "- strata:", nrow(sc), "\n")
+  print(table(sc$n_case))   # all 1s
+  print(summary(sc$n))      # mostly 11
+})
+```
+
+## 3b. Crossing counts: which crossing terms can be estimated?
+
+```{r crossing-counts}
+cross_all <- c("fence_cross", "road_cross", "river_cross")
+
+used_cross <- imap_dfr(kaza, ~ .x |> filter(case_) |>
+                         summarise(across(all_of(cross_all), sum), n_used = n()) |>
+                         mutate(season = .y, .before = 1))
+used_cross
+
+avail_cross <- imap_dfr(kaza, ~ .x |> filter(!case_) |>
+                          summarise(across(all_of(cross_all), sum), n_avail = n()) |>
+                          mutate(season = .y, .before = 1))
+avail_cross
+
+cross_terms <- cross_all[map_lgl(cross_all, ~ min(used_cross[[.x]]) >= min_used_cross)]
+cat("Crossing terms used:", cross_terms, "\n")
+dropped <- setdiff(cross_all, cross_terms)
+if (length(dropped)) message("Dropped (< ", min_used_cross, " used crossings in a season): ",
+                             paste(dropped, collapse = ", "))
+
+# overlap between each crossing indicator and its distance-to term (available steps)
+imap_dfr(kaza, ~ .x |> filter(!case_) |>
+           summarise(fence = cor(fence_cross, fence_dist),
+                     road  = cor(road_cross, road_dist),
+                     river_vs_water = cor(river_cross, water_rivers_dist)) |>
+           mutate(season = .y, .before = 1))
+```
+
+## 3c. Save prepped steps (for BCI)
+
+`outputs/` is gitignored and the files are large; share via the team drive, not git. List
+columns (raw along-step values) are dropped; the summarized columns already exist. File names
+say `_lcdist` if the land cover is still distance-to.
+
+```{r save-linecross}
+iwalk(kaza, function(d, s) {
+  p <- here("outputs", paste0("ele_trk_extract_kaza_", s, "_linecross",
+                              if (identical(lc_terms, lc_dist)) "_lcdist", ".rds"))
+  if (!file.exists(p)) {
+    d |> select(-any_of(c("terrain_list", "linear_list"))) |> saveRDS(p)
+  }
+})
+```
+
+## 4. Formulas and model data
+
+Every model below is fit on the same NA-filtered rows per season, so AIC/BIC are comparable
+across all scenarios and the step-length check.
+
+```{r formulas}
+make_f <- function(terms) reformulate(c(terms, "strata(step_id_)"), response = "case_")
+
+main_terms <- c(dist_lin, hab_terms, lc_terms, cross_terms)
+
+# scenario 3: each crossing term replaces its own distance-to term;
+# river_cross has no pair (water_rivers_dist is land-cover water, kept unless drop_water)
+pairs            <- c(fence_cross = "fence_dist", road_cross = "road_dist")
+replaced         <- unname(pairs[intersect(names(pairs), cross_terms)])
+cross_only_terms <- setdiff(main_terms, c(replaced, if (drop_water) "water_rivers_dist"))
+
+f_main       <- make_f(main_terms)                              # 2. distance-to + crossings
+f_slcheck    <- make_f(c(main_terms, "sl_", "log_sl_"))         # robustness check
+f_base       <- make_f(c(dist_lin, hab_terms, lc_terms))        # 1. distance-to only
+f_cross_only <- make_f(cross_only_terms)                        # 3. crossings replace distance-to
+
+f_main
+f_cross_only
+
+model_vars <- unique(c(main_terms, "sl_", "case_", "step_id_"))
+kaza_model_dat <- map(kaza, ~ .x |> drop_na(all_of(model_vars)) |> mutate(log_sl_ = log(sl_)))
+
+# checkpoint: rows dropped by the NA filter (should be 0 or very few)
+map2_int(kaza, kaza_model_dat, ~ nrow(.x) - nrow(.y))
+
+rm(kaza); gc()
+```
+
+## 5. Fit (cached)
+
+Four models per season on ~4–5M rows each, so this takes a while. The cache stores a
+signature (formulas, settings, row counts); if any of those change, it refits instead of
+loading stale fits.
+
+```{r fit}
+fit_sig <- list(formulas   = map_chr(list(f_main, f_slcheck, f_base, f_cross_only),
+                                     ~ paste(deparse(.x), collapse = "")),
+                lc_terms   = lc_terms,
+                drop_water = drop_water,
+                n          = map_int(kaza_model_dat, nrow))
+
+cached <- function(path, sig, expr) {
+  if (file.exists(path)) {
+    obj <- readRDS(path)
+    if (identical(obj$sig, sig)) return(obj$value)
+    message("Cache is stale (settings or data changed), refitting: ", basename(path))
+  }
+  value <- expr   # evaluated only here
+  saveRDS(list(sig = sig, value = value), path)
+  value
+}
+
+lc_tag <- if (identical(lc_terms, lc_dist)) "_lcdist" else ""
+
+kaza_fits <- cached(
+  here("outputs", paste0("kaza_ssf_crossing_fits", lc_tag, ".rds")), fit_sig,
+  map(kaza_model_dat, ~ list(main    = fit_clogit(.x, f_main, model = FALSE),
+                             slcheck = fit_clogit(.x, f_slcheck, model = FALSE))))
+
+scen_fits <- cached(
+  here("outputs", paste0("kaza_ssf_scenario_fits", lc_tag, if (drop_water) "_nowater", ".rds")),
+  fit_sig,
+  map(kaza_model_dat, ~ list(base       = fit_clogit(.x, f_base, model = FALSE),
+                             cross_only = fit_clogit(.x, f_cross_only, model = FALSE))))
+
+summary(kaza_fits$wet$main)
+summary(kaza_fits$dry$main)
+```
+
+## 6. Robustness to step length
+
+`shift_over_se` = change in each crossing coefficient when step length is added, in units of
+the main model's SE. |shift| < ~2 SE = robust. `sl_` units don't matter here (`log_sl_` only
+shifts by a constant and `sl_` rescales its own coefficient), but don't compare `sl_`
+coefficients across populations.
+
+```{r robustness}
+robustness <- map_dfr(names(kaza_fits), function(s) {
+  m  <- summary(kaza_fits[[s]]$main)$coefficients[cross_terms, , drop = FALSE]
+  sc <- summary(kaza_fits[[s]]$slcheck)$coefficients[cross_terms, , drop = FALSE]
+  tibble(season = s, term = cross_terms,
+         coef_main = m[, "coef"], se_main = m[, "se(coef)"],
+         rel_sel_main = exp(m[, "coef"]),
+         coef_sl = sc[, "coef"],
+         shift_over_se = (sc[, "coef"] - m[, "coef"]) / m[, "se(coef)"])
+})
+robustness
+```
+
+## 7. Three scenarios: add vs. replace
+
+```{r scenarios}
+scenario_table <- map_dfr(c("wet", "dry"), function(s) {
+  mods <- list("1. distance-to only"              = scen_fits[[s]]$base$model,
+               "2. distance-to + crossings"       = kaza_fits[[s]]$main$model,
+               "3. crossings replace distance-to" = scen_fits[[s]]$cross_only$model)
+  stopifnot(n_distinct(map_int(mods, "n")) == 1)    # same rows in all three
+  tibble(season = s, scenario = names(mods),
+         n   = map_int(mods, "n"),
+         k   = map_int(mods, ~ length(coef(.x))),
+         AIC = map_dbl(mods, AIC),
+         BIC = map_dbl(mods, BIC)) |>
+    mutate(dAIC = AIC - min(AIC), dBIC = BIC - min(BIC))
+})
+scenario_table
+
+# crossing coefficients with vs without the distance-to terms
+map_dfr(c("wet", "dry"), ~ tibble(
+  season = .x, term = cross_terms,
+  with_dist    = coef(kaza_fits[[.x]]$main$model)[cross_terms],
+  without_dist = coef(scen_fits[[.x]]$cross_only$model)[cross_terms]))
+
+# step-length check vs main (same rows, so AIC is comparable)
+map_dfr(c("wet", "dry"), ~ tibble(
+  season = .x, model = c("SSF + crossings", "+ sl_ + log_sl_"),
+  AIC = c(AIC(kaza_fits[[.x]]$main$model), AIC(kaza_fits[[.x]]$slcheck$model))) |>
+  mutate(dAIC = AIC - min(AIC)))
+```
+
+```{r}
+#Plot to visualize linear features + movement
+
+library(terra)
+
+# --- sampled used locations (both seasons) ---
+kaza_pts <- imap_dfr(kaza_model_dat, ~ .x |> filter(case_) |>
+                       slice_sample(n = 15000) |>
+                       select(x2_, y2_) |> mutate(season = .y))
+
+# plot window: elephant range + 0.75° buffer, so nearby fences outside the range show up too
+bb <- c(xmin = min(kaza_pts$x2_) - 0.75, xmax = max(kaza_pts$x2_) + 0.75,
+        ymin = min(kaza_pts$y2_) - 0.75, ymax = max(kaza_pts$y2_) + 0.75)
+
+# --- linear feature cells from the 500 m rasters the model used ---
+lin_cells <- function(file, label) {
+  r <- rast(here("data", "Linear_features", file))
+  e <- project(ext(bb["xmin"], bb["xmax"], bb["ymin"], bb["ymax"]),
+               from = "EPSG:4326", to = crs(r))
+  df <- r |> crop(e) |> project("EPSG:4326", method = "near") |> as.data.frame(xy = TRUE)
+  df <- df[df[[3]] > 0, c("x", "y")]
+  cat(label, ":", nrow(df), "cells\n")              # checkpoint
+  df |> mutate(feature = label)
+}
+
+kaza_lines <- bind_rows(
+  lin_cells("roads_linear_500m.tif",           "Road"),
+  lin_cells("hydrorivers_linear_500m.tif",     "River"),
+  lin_cells("kaza_vet_fences_linear_500m.tif", "Vet fence")
+) |>
+  mutate(feature = factor(feature, levels = c("Road", "River", "Vet fence")))  # fences drawn last (on top)
+
+# --- plot ---
+p_kaza_lin <- ggplot() +
+  geom_point(data = kaza_pts, aes(x2_, y2_), colour = "grey55", size = 0.15, alpha = 0.3) +
+  geom_point(data = kaza_lines |> arrange(feature),
+             aes(x, y, colour = feature), shape = 15, size = 0.35) +
+  scale_colour_manual(values = c("Road" = "#E69F00", "River" = "#0072B2", "Vet fence" = "#D7191C"),
+                      name = NULL) +
+  facet_wrap(~ season, ncol = 1) +
+  coord_quickmap(xlim = bb[c("xmin", "xmax")], ylim = bb[c("ymin", "ymax")], expand = FALSE) +
+  guides(colour = guide_legend(override.aes = list(size = 3))) +
+  labs(title = "KAZA elephant locations and linear features used in the SSF",
+       subtitle = "Grey = used steps (15k sample per season); features = 500 m crossing rasters",
+       caption = "Used fence crossings: 4 (wet), 8 (dry); random-step fence crossings: 269 (wet), 70 (dry)",
+       x = NULL, y = NULL) +
+  theme_minimal() +
+  theme(legend.position = "top")
+
+p_kaza_lin
+
+dir.create(here("outputs", "figures"), showWarnings = FALSE)
+ggsave(here("outputs", "figures", "kaza_points_linear_features.png"),
+       p_kaza_lin, width = 9, height = 10, dpi = 200, bg = "white")
+```
+
+
+## 8. How every coefficient shifts: base → + crossings → + movement terms
+
+Shifts are in units of the main model's SE, so they're comparable across covariates on very
+different scales. |shift| > ~2 SE = worth noting.
+
+```{r coef-compare}
+coef_compare <- map_dfr(c("wet", "dry"), function(s) {
+  b  <- coef(scen_fits[[s]]$base$model)
+  m  <- coef(kaza_fits[[s]]$main$model)
+  mv <- coef(kaza_fits[[s]]$slcheck$model)
+  se <- sqrt(diag(vcov(kaza_fits[[s]]$main$model)))
+  terms <- names(m)
+  tibble(season = s, term = terms,
+         base = b[terms], with_cross = m, with_move = mv[terms], se_main = se,
+         shift_cross_se = (m - b[terms]) / se,     # effect of adding crossings
+         shift_move_se  = (mv[terms] - m) / se)    # effect of adding movement terms
+})
+
+coef_compare |> select(season, term, shift_cross_se, shift_move_se) |>
+  arrange(season, desc(abs(shift_cross_se)))
+coef_compare |> select(season, term, shift_cross_se, shift_move_se) |>
+  arrange(season, desc(abs(shift_move_se)))
+
+# save summary tables for the cross-population comparison
+saveRDS(list(scenario_table = scenario_table, robustness = robustness,
+             coef_compare = coef_compare, used_cross = used_cross,
+             cross_terms = cross_terms, lc_terms = lc_terms),
+        here("outputs", paste0("kaza_linear_summary", lc_tag, ".rds")))
+```
+
