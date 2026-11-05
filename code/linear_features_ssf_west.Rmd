@@ -1,0 +1,273 @@
+---
+title: "linear_features_ssf_west"
+author: "Rachel Frost"
+date: "2026-11-04"
+output: html_document
+---
+
+#Created so we can call on extracted steps and linear features and others can 
+#run it more easily 
+
+```{r setup}
+library(tidyverse)
+library(here)
+library(amt)
+library(survival)
+select <- dplyr::select
+```
+
+##1. Load extracted steps
+
+```{r load}
+west_path <- here("outputs", "ele_west_1hr_categ.rds")
+ele_trk_extract_west <- readRDS(west_path)
+nrow(ele_trk_extract_west)   # expect 3,690,049
+```
+
+## 2. Prep: unique strata, crossing indicators, land cover NAs
+
+```{r prep}
+lin_cols <- c("kaza_vet_fences_linear", "roads_linear", "hydrorivers_linear")
+stopifnot(all(lin_cols %in% names(ele_trk_extract_west)))   
+
+#checkpoints
+head(ele_trk_extract_west$step_id_)                          #already "id_123"?
+table(ele_trk_extract_west$season, useNA = "ifany")          #expect "wet"/"dry" only
+sum(ele_trk_extract_west$sl_ <= 0, na.rm = TRUE)             #zero-length steps
+colSums(is.na(ele_trk_extract_west[, c("grassland", "shrubland", "tree_cover")]))  #NAs to 0
+
+# >>> NEW: only prefix step_id_ if it isn't already unique across elephants
+already_prefixed <- all(str_starts(as.character(ele_trk_extract_west$step_id_),
+                                   paste0(ele_trk_extract_west$id, "_")))
+
+ele_trk_extract_west <- ele_trk_extract_west |>              # >>> CHANGED
+  mutate(
+    step_id_ = if (already_prefixed) step_id_ else paste(id, step_id_, sep = "_"),  # >>> CHANGED
+    across(all_of(lin_cols), ~ if_else(is.infinite(.x) | is.na(.x), 0, .x)),
+    fence_cross = as.integer(kaza_vet_fences_linear > 0),
+    road_cross  = as.integer(roads_linear > 0),
+    river_cross = as.integer(hydrorivers_linear > 0),
+    across(c(grassland, shrubland, tree_cover), ~ replace_na(.x, 0))
+  ) |>
+  filter(!is.na(sl_), sl_ > 0)                               # >>> NEW: log_sl_ must be finite
+
+# >>> NEW: checkpoint, strata intact (each step_id_ has exactly 1 used step)
+strata_check <- ele_trk_extract_west |> group_by(step_id_) |>
+  summarise(n_case = sum(case_), n = n(), .groups = "drop")
+table(strata_check$n_case)   # all 1s
+summary(strata_check$n)      # mostly 11
+
+# >>> NEW: checkpoint, enough used crossings per feature? (< ~30 → drop that term)
+ele_trk_extract_west |> filter(case_) |> group_by(season) |>
+  summarise(across(c(fence_cross, road_cross, river_cross), sum), n_used = n())
+
+ele_trk_extract_west_wet <- ele_trk_extract_west |> filter(season == "wet")   # >>> CHANGED
+ele_trk_extract_west_dry <- ele_trk_extract_west |> filter(season == "dry")   # >>> CHANGED
+
+# >>> CHANGED: new name, guarded, list columns dropped (same as final Etosha version)
+linecross_path <- here("outputs", "ele_trk_extract_west_linecross.rds")
+if (!file.exists(linecross_path)) {
+  ele_trk_extract_west |>
+    select(-any_of(c("terrain_list", "linear_list"))) |>
+    saveRDS(linecross_path)
+}
+```
+
+## 3. Checks: crossing counts and overlap with distance-to terms
+
+```{r checks}
+check_crossings <- function(d) {
+  list(
+    counts = d |> group_by(case_) |>
+      summarise(fence = sum(fence_cross), road = sum(road_cross), river = sum(river_cross)),
+    cor = c(fence = cor(d$fence_dist, d$fence_cross, use = "complete.obs"),
+            road  = cor(d$road_dist, d$road_cross, use = "complete.obs"),
+            river = cor(d$water_rivers_dist, d$river_cross, use = "complete.obs"))
+  )
+}
+
+check_crossings(ele_trk_extract_etosha_wet)
+check_crossings(ele_trk_extract_etosha_dry)
+```
+
+## 4. Fit main SSF + step-length robustness check
+
+Main model has no movement terms. The `slcheck` model adds `sl_` + `log_sl_` only to test
+whether crossing coefficients are confounded with step length; it is not the reported model.
+Note `sl_` is in degrees here (track built in EPSG:4326); fine for this comparison.
+
+Fitting is slow (~3.5M rows per season), so fits are cached.
+
+```{r fit}
+fits_path <- here("outputs", "west_ssf_crossing_fits.rds")
+
+# >>> CHANGED: river_cross removed (0 crossings in West with the current river layer)
+f_main <- case_ ~ fence_dist + road_dist + water_rivers_dist +
+  cropland_dist + grassland + shrubland + urban_dist + tree_cover +
+  elevation + slope + aspect + evi + world_pop +
+  fence_cross + road_cross + strata(step_id_)
+
+f_slcheck <- update(f_main, . ~ . + sl_ + log_sl_)
+
+# >>> NEW: one NA-filtered dataset per season, used by EVERY model below
+model_vars <- c(all.vars(f_main), "sl_")
+prep_model_dat <- function(d) d |> drop_na(all_of(model_vars)) |> mutate(log_sl_ = log(sl_))
+
+west_model_dat <- list(wet = prep_model_dat(ele_trk_extract_west_wet),
+                       dry = prep_model_dat(ele_trk_extract_west_dry))
+
+# checkpoint: rows dropped by NA filter (should be 0 or very few)
+c(wet = nrow(ele_trk_extract_west_wet) - nrow(west_model_dat$wet),
+  dry = nrow(ele_trk_extract_west_dry) - nrow(west_model_dat$dry))
+
+# >>> NEW: free memory, the linecross file is already saved
+rm(ele_trk_extract_west, ele_trk_extract_west_wet, ele_trk_extract_west_dry); gc()
+
+fit_season <- function(d) {
+  list(main    = fit_clogit(d, f_main, model = FALSE),
+       slcheck = fit_clogit(d, f_slcheck, model = FALSE))
+}
+
+if (file.exists(fits_path)) {
+  west_fits <- readRDS(fits_path)
+} else {
+  west_fits <- map(west_model_dat, fit_season)
+  saveRDS(west_fits, fits_path)
+}
+
+summary(west_fits$wet$main)
+summary(west_fits$dry$main)
+```
+
+## 5. Robustness table
+
+`shift_over_se` = change in crossing coefficient when step length is added, in units of the
+main model's SE. |shift| < 1 SE = robust.
+
+```{r robustness}
+cross_terms <- c("fence_cross", "road_cross")   # >>> CHANGED
+
+robustness <- map_dfr(names(west_fits), function(s) {
+  m  <- summary(west_fits[[s]]$main)$coefficients[cross_terms, ]
+  sc <- summary(west_fits[[s]]$slcheck)$coefficients[cross_terms, ]
+  tibble(season = s, term = cross_terms,
+         coef_main = m[, "coef"], se_main = m[, "se(coef)"],
+         rel_sel_main = exp(m[, "coef"]),
+         coef_sl = sc[, "coef"],
+         shift_over_se = (sc[, "coef"] - m[, "coef"]) / m[, "se(coef)"])
+})
+robustness
+```
+
+##Steps 6: 
+
+```{r aic}
+compare_crossing <- function(data, label) {
+  d <- data |>
+    drop_na(fence_dist, road_dist, water_rivers_dist, cropland_dist, urban_dist,
+            grassland, shrubland, tree_cover, elevation, slope, aspect, evi, world_pop,
+            fence_cross, road_cross, river_cross)
+
+  base  <- fit_clogit(d, update(f_main, . ~ . - fence_cross - road_cross - river_cross),
+                      model = FALSE)
+  cross <- fit_clogit(d, f_main, model = FALSE)
+
+  tibble(season = label, model = c("base", "+ crossings"),
+         AIC = c(AIC(base$model), AIC(cross$model)),
+         BIC = c(BIC(base$model), BIC(cross$model))) |>
+    mutate(dAIC = AIC - min(AIC), dBIC = BIC - min(BIC))
+}
+
+aic_path <- here("outputs", "etosha_crossing_aic.rds")
+if (file.exists(aic_path)) {
+  crossing_aic <- readRDS(aic_path)
+} else {
+  crossing_aic <- bind_rows(compare_crossing(ele_trk_extract_etosha_wet, "Etosha wet"),
+                            compare_crossing(ele_trk_extract_etosha_dry, "Etosha dry"))
+  saveRDS(crossing_aic, aic_path)
+}
+crossing_aic
+```
+
+
+## 7. Three linear-feature scenarios
+
+1. Distance-to only (`base` from section 6)
+2. Distance-to + crossings (`main` from section 4)
+3. Crossings replace distance-to for fences and roads (and rivers, via `river_cross`)
+
+`water_rivers_dist` is kept in scenario 3 by default: it comes from the land-cover water
+class (pans, waterholes), not the HydroRIVERS line layer, so it is mostly a water-access
+habitat effect. Set `drop_water <- TRUE` to also drop it.
+
+Only scenario 3 is fit here. Rows are filtered on the same variable set as section 6, so `n`
+matches across all three scenarios and AIC is comparable.
+
+```{r scenarios}
+drop_water <- FALSE
+
+f_base       <- update(f_main, . ~ . - fence_cross - road_cross)              # >>> CHANGED
+f_cross_only <- update(f_main, . ~ . - fence_dist - road_dist)
+if (drop_water) f_cross_only <- update(f_cross_only, . ~ . - water_rivers_dist)
+
+# >>> CHANGED: base + cross-only fit once on the same rows, cached together
+scen_path <- here("outputs", paste0("west_ssf_scenario_fits", if (drop_water) "_nowater", ".rds"))
+if (file.exists(scen_path)) {
+  scen_fits <- readRDS(scen_path)
+} else {
+  scen_fits <- map(west_model_dat, ~ list(
+    base       = fit_clogit(.x, f_base, model = FALSE),
+    cross_only = fit_clogit(.x, f_cross_only, model = FALSE)))
+  saveRDS(scen_fits, scen_path)
+}
+
+scenario_table <- map_dfr(c("wet", "dry"), function(s) {
+  mods <- list("1. distance-to only"              = scen_fits[[s]]$base$model,
+               "2. distance-to + crossings"       = west_fits[[s]]$main$model,
+               "3. crossings replace distance-to" = scen_fits[[s]]$cross_only$model)
+  stopifnot(n_distinct(map_int(mods, "n")) == 1)    # same rows in all three
+  tibble(season = s, scenario = names(mods),
+         n   = map_int(mods, "n"),
+         k   = map_int(mods, ~ length(coef(.x))),
+         AIC = map_dbl(mods, AIC),
+         BIC = map_dbl(mods, BIC)) |>
+    mutate(dAIC = AIC - min(AIC), dBIC = BIC - min(BIC))
+})
+scenario_table
+
+# crossing coefficients with vs without the distance-to terms
+map_dfr(c("wet", "dry"), ~ tibble(
+  season = .x, term = cross_terms,
+  with_dist    = coef(west_fits[[.x]]$main$model)[cross_terms],
+  without_dist = coef(scen_fits[[.x]]$cross_only$model)[cross_terms]))
+
+# step-length check vs main (same rows, so AIC is comparable)
+map_dfr(c("wet", "dry"), ~ tibble(
+  season = .x, model = c("SSF + crossings", "+ sl_ + log_sl_"),
+  AIC = c(AIC(west_fits[[.x]]$main$model), AIC(west_fits[[.x]]$slcheck$model))) |>
+  mutate(dAIC = AIC - min(AIC)))
+```
+
+#Step 8 
+
+```{r coef-compare}
+coef_compare <- map_dfr(c("wet", "dry"), function(s) {
+  b  <- coef(scen_fits[[s]]$base$model)                 # >>> CHANGED: reuses section 6-7 fit
+  m  <- coef(west_fits[[s]]$main$model)
+  mv <- coef(west_fits[[s]]$slcheck$model)
+  se <- sqrt(diag(vcov(west_fits[[s]]$main$model)))
+  terms <- names(m)
+  tibble(season = s, term = terms,
+         base = b[terms], with_cross = m, with_move = mv[terms], se_main = se,
+         shift_cross_se = (m - b[terms]) / se,
+         shift_move_se  = (mv[terms] - m) / se)
+})
+
+coef_compare |> arrange(season, desc(abs(shift_cross_se)))
+coef_compare |> arrange(season, desc(abs(shift_move_se)))
+
+# >>> NEW: save summary tables for the cross-population comparison
+saveRDS(list(scenario_table = scenario_table, robustness = robustness,
+             coef_compare = coef_compare, note = "river_cross excluded: 0 crossings with gte5 layer"),
+        here("outputs", "west_linear_summary.rds"))
+```
