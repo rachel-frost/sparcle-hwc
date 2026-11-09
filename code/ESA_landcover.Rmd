@@ -861,18 +861,5 @@ par(mfrow = c(1, 1))
 
 
 ```
-```{r}
-fences <- vect(fence_file)
-print(fences)                       # geometry type, number of features, CRS
-print(crs(fences, describe = TRUE)) # is a CRS defined at all?
-print(ext(fences))                  # do these coordinates look like lon/lat or UTM?
 
-fences_c <- crop(fences, common_ext)
-cat("Features before crop:", nrow(fences), " after crop:", nrow(fences_c), "\n")
-
-fence_bin <- rasterize(fences_c, target_template, field = 1, background = 0,
-                       touches = TRUE, fun = "max")
-print(freq(fence_bin))              # is there any "1" at all?
-
-```
 
