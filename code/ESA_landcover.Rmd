@@ -856,6 +856,17 @@ par(mfrow = c(1, 1))
 ```
 
 ```{r}
+#==============================
+#Distance to ephemeral rivers 
+#==============================
 
+#West 
+west_ephemeral_dist <- rast("~/Desktop/Arnhold/sparcle-hwc-old2/code/sparcle-hwc/data/Linear_features/west_ephemeral_rivers_dist_1k_500m.tif")
+print(west_ephemeral_dist)
+plot(west_ephemeral_dist)
+
+west_ephemeral_prox <- rast("~/Desktop/Arnhold/sparcle-hwc-old2/code/sparcle-hwc/data/Linear_features/west_ephemeral_rivers_prox_1k_500m.tif")
+print(west_ephemeral_prox)
+plot(west_ephemeral_prox)
 ```
 
