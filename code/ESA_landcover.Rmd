@@ -853,13 +853,9 @@ plot(fence_bin, main = "Fence (binary)")
 plot(dist_fence, main = "Distance to fence (m)")
 par(mfrow = c(1, 1))
 
-
-
-
-
-
-
-
 ```
 
+```{r}
+
+```
 
