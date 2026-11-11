@@ -853,26 +853,20 @@ plot(fence_bin, main = "Fence (binary)")
 plot(dist_fence, main = "Distance to fence (m)")
 par(mfrow = c(1, 1))
 
-
-
-
-
-
-
-
 ```
+
 ```{r}
-fences <- vect(fence_file)
-print(fences)                       # geometry type, number of features, CRS
-print(crs(fences, describe = TRUE)) # is a CRS defined at all?
-print(ext(fences))                  # do these coordinates look like lon/lat or UTM?
+#==============================
+#Distance to ephemeral rivers 
+#==============================
 
-fences_c <- crop(fences, common_ext)
-cat("Features before crop:", nrow(fences), " after crop:", nrow(fences_c), "\n")
+#West 
+west_ephemeral_dist <- rast("~/Desktop/Arnhold/sparcle-hwc-old2/code/sparcle-hwc/data/Linear_features/west_ephemeral_rivers_dist_1k_500m.tif")
+print(west_ephemeral_dist)
+plot(west_ephemeral_dist)
 
-fence_bin <- rasterize(fences_c, target_template, field = 1, background = 0,
-                       touches = TRUE, fun = "max")
-print(freq(fence_bin))              # is there any "1" at all?
-
+west_ephemeral_prox <- rast("~/Desktop/Arnhold/sparcle-hwc-old2/code/sparcle-hwc/data/Linear_features/west_ephemeral_rivers_prox_1k_500m.tif")
+print(west_ephemeral_prox)
+plot(west_ephemeral_prox)
 ```
 
