@@ -271,3 +271,451 @@ saveRDS(list(scenario_table = scenario_table, robustness = robustness,
              coef_compare = coef_compare, note = "river_cross excluded: 0 crossings with gte5 layer"),
         here("outputs", "west_linear_summary.rds"))
 ```
+
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#######################################################
+# Update code 11/11/26 with added vet fence layer and ephemeral rivers
+
+```{r setup}
+library(here)
+library(tidyverse)
+library(sf)
+library(terra)
+library(survival)
+if (!requireNamespace("sfheaders", quietly = TRUE)) install.packages("sfheaders")
+select <- dplyr::select
+filter <- dplyr::filter
+```
+
+```{r paths}
+library(here); library(tidyverse); library(sf); library(terra); library(survival)
+select <- dplyr::select
+filter <- dplyr::filter
+
+WEST_ALL   <- here("outputs", "ele_trk_extract_west_linecross.rds")
+SEASON_COL <- "season"
+STRATA_COL <- "step_id_"
+MIN_USED_CROSS <- 50
+STEP_FILES <- c(
+  wet = here("outputs", "ele_trk_extract_west_wet_input.rds"),
+  dry = here("outputs", "ele_trk_extract_west_dry_input.rds")
+)
+```
+```{r}
+#split by season 
+all_steps <- readRDS(WEST_ALL)
+stopifnot(SEASON_COL %in% names(all_steps), all(c("tree_cover", "shrubland", "grassland") %in% names(all_steps)))
+print(table(all_steps[[SEASON_COL]]))
+print(c(strata = n_distinct(all_steps[[STRATA_COL]]), used = sum(all_steps$case_)))   # should be equal
+rm(all_steps); gc()
+
+file.remove(STEP_FILES[file.exists(STEP_FILES)])
+for (s in names(STEP_FILES)) {
+  all_steps <- readRDS(WEST_ALL)
+  part <- all_steps[all_steps[[SEASON_COL]] == s, ] |> select(-any_of(c("terrain_list", "linear_list")))
+  rm(all_steps); gc()
+  stopifnot(nrow(part) > 0)
+  saveRDS(part, STEP_FILES[[s]])
+  n_check <- nrow(readRDS(STEP_FILES[[s]]))
+  cat(s, nrow(part), "rows saved,", n_check, "rows read back\n")
+  rm(part); gc()
+}
+```
+
+```{r}
+FENCE_RAST <- here("data", "Linear_features", "all_vet_fences", "vetfences_all_500m.tif")
+FENCE_DIST <- here("data", "Linear_features", "all_vet_fences", "dist_vetfences_500m.tif")
+FENCE_VEC  <- NULL   # set to Marissa's fence shapefile when she shares it
+HR_AFRICA  <- here("data", "Linear_features", "HydroRIVERS_v10_af.gdb", "HydroRIVERS_v10_af.gdb")
+HR_LAYER   <- st_layers(HR_AFRICA)$name[1]
+PERENNIAL  <- here("data", "Linear_features", "hydrorivers_namibia_gte5.shp")
+ROAD_PATH  <- here("data", "Linear_features", "roads_selected_exported.shp")
+
+stopifnot(all(file.exists(STEP_FILES)), file.exists(FENCE_RAST), file.exists(FENCE_DIST),
+          dir.exists(HR_AFRICA), file.exists(PERENNIAL), file.exists(ROAD_PATH))
+
+# West coordinates: lon/lat should be x ~12-15, y ~ -18 to -21; UTM would be in the hundreds of thousands
+chk <- readRDS(STEP_FILES[["dry"]])
+cat("West x range:", range(chk$x2_, na.rm = TRUE), "| y range:", range(chk$y2_, na.rm = TRUE), "\n")
+if (max(abs(chk$x2_), na.rm = TRUE) > 180)
+  stop("West steps are projected, not lon/lat. Paste the ranges before continuing.")
+rm(chk); gc()
+
+crs_steps    <- "EPSG:4326"
+fence_r      <- rast(FENCE_RAST)
+fence_dist_r <- rast(FENCE_DIST)
+tmpl         <- fence_r
+stopifnot(same.crs(fence_r, crs_steps), compareGeom(fence_r, fence_dist_r, stopOnError = FALSE))
+
+sf_use_s2(FALSE)
+```
+
+
+
+## Helpers
+
+```{r helpers}
+# clean_names() may have stripped amt's trailing underscores, so look for either version
+pick_col <- function(d, opts) {
+  hit <- intersect(opts, names(d))
+  if (length(hit) == 0) stop("None of these columns found: ", paste(opts, collapse = ", "))
+  hit[1]
+}
+
+standardize_cols <- function(d) {
+  map <- c(x1_ = pick_col(d, c("x1_", "x1")), y1_ = pick_col(d, c("y1_", "y1")),
+           x2_ = pick_col(d, c("x2_", "x2")), y2_ = pick_col(d, c("y2_", "y2")),
+           case_ = pick_col(d, c("case_", "case")), sl_ = pick_col(d, c("sl_", "sl")))
+  # coordinates are degrees, so amt's sl_ is in degrees too. Step length in metres (good approximation at 1-hr steps):
+  d |> rename(any_of(setNames(map, names(map)))) |>
+    mutate(sl_m = sqrt(((x2_ - x1_) * 111320 * cos((y1_ + y2_) / 2 * pi / 180))^2 +
+                       ((y2_ - y1_) * 110574)^2),
+           log_sl_m = log(pmax(sl_m, 1)))
+}
+
+# Step lines in batches -> TRUE if the step line intersects any feature line
+cross_vec <- function(d, lines, batch = 250000) {
+  out <- logical(nrow(d))
+  idx <- split(seq_len(nrow(d)), ceiling(seq_len(nrow(d)) / batch))
+  for (i in seq_along(idx)) {
+    ii <- idx[[i]]
+    ok <- ii[d$sl_[ii] > 0 & !is.na(d$x2_[ii])]   # zero-length / NA steps can't cross
+    if (length(ok)) {
+      df <- tibble(id = rep(seq_along(ok), each = 2),
+                   x  = as.vector(rbind(d$x1_[ok], d$x2_[ok])),
+                   y  = as.vector(rbind(d$y1_[ok], d$y2_[ok])))
+      sl <- sfheaders::sf_linestring(df, x = "x", y = "y", linestring_id = "id") |>
+        st_set_crs(st_crs(lines))
+      out[ok] <- lengths(st_intersects(sl, lines)) > 0
+    }
+    cat(sprintf("  batch %d/%d done\n", i, length(idx)))
+  }
+  as.integer(out)
+}
+
+# Raster version of a crossing, for when there's no fence vector.
+# any    = step line passes through a fence cell (what the old 500 m method did; blends proximity)
+# strict = passes through a fence cell AND neither endpoint is in a fence cell
+#          (removes steps that end on, or walk along, the fence; can miss real crossings that end right past it)
+cross_rast <- function(d, r, batch = 250000) {
+  is_fence <- function(v) !is.na(v) & v > 0
+  any_ <- logical(nrow(d))
+  idx <- split(seq_len(nrow(d)), ceiling(seq_len(nrow(d)) / batch))
+  for (i in seq_along(idx)) {
+    ii <- idx[[i]]
+    ok <- ii[d$sl_[ii] > 0 & !is.na(d$x2_[ii])]
+    if (length(ok)) {
+      df <- tibble(id = rep(seq_along(ok), each = 2),
+                   x  = as.vector(rbind(d$x1_[ok], d$x2_[ok])),
+                   y  = as.vector(rbind(d$y1_[ok], d$y2_[ok])))
+      sl <- sfheaders::sf_linestring(df, x = "x", y = "y", linestring_id = "id") |>
+        st_set_crs(st_crs(crs_steps))
+      e <- terra::extract(r, vect(sl), fun = max, na.rm = TRUE)
+      any_[ok] <- is_fence(e[, 2])
+    }
+    cat(sprintf("  batch %d/%d done\n", i, length(idx)))
+  }
+  start_in <- is_fence(terra::extract(r, cbind(d$x1_, d$y1_))[, 1])
+  end_in   <- is_fence(terra::extract(r, cbind(d$x2_, d$y2_))[, 1])
+  tibble(any = as.integer(any_), strict = as.integer(any_ & !start_in & !end_in))
+}
+
+# Rasterize lines on the 500 m template, then distance (m) to nearest line cell
+dist_raster <- function(lines) {
+  t <- crop(tmpl, vect(bb_pop))          # crop first: much faster than the full grid
+  distance(rasterize(vect(lines), t, touches = TRUE))
+}
+
+prep_lines <- function(x, bbox_sf) {
+  x |> st_zm() |> st_transform(crs_steps) |>
+    st_filter(bbox_sf) |> select(any_of(c("HYRIV_ID", "UPLAND_SKM", "DIS_AV_CMS")))
+}
+```
+
+## Checkpoint 1: steps load, columns, bad fixes
+
+Load one file at a time (both at once crashed R last time).
+
+```{r check-steps}
+bb_all <- NULL
+for (s in names(STEP_FILES)) {
+  d <- readRDS(STEP_FILES[[s]]) |> standardize_cols()
+  stopifnot(STRATA_COL %in% names(d))
+  cat("\n==", s, "==  rows:", nrow(d), " strata:", n_distinct(d[[STRATA_COL]]), "\n")
+  print(table(d$case_))
+
+  # Bad fixes: used 1-hr steps > 8 km. MET23/MET42 caused West's wet-season artifact.
+  cat("sl_ range (degrees?):", round(range(d$sl_, na.rm = TRUE), 4), "  sl_m median (m):", round(median(d$sl_m[d$case_ == 1], na.rm = TRUE)), "\n")
+  bad <- d |> filter(case_ == 1, sl_m > 8000)
+  cat("Used steps > 8 km:", nrow(bad), "\n")
+  if (nrow(bad) > 0 && "id" %in% names(d)) print(count(bad, id, sort = TRUE))
+  if (any(c("MET23", "MET42") %in% d$id)) warning("MET23/MET42 present in West ", s, ": inspect before fitting")
+
+  bb_s <- st_as_sfc(st_bbox(c(xmin = min(d$x2_, na.rm = TRUE), ymin = min(d$y2_, na.rm = TRUE),
+                              xmax = max(d$x2_, na.rm = TRUE), ymax = max(d$y2_, na.rm = TRUE)),
+                            crs = st_crs(crs_steps)))
+  bb_all <- if (is.null(bb_all)) bb_s else st_union(bb_all, bb_s)
+  rm(d); gc()
+}
+b <- st_bbox(bb_all)
+bb_pop <- st_as_sfc(st_bbox(c(xmin = b[["xmin"]] - 0.2, ymin = b[["ymin"]] - 0.2,
+                               xmax = b[["xmax"]] + 0.2, ymax = b[["ymax"]] + 0.2),
+                             crs = st_crs(crs_steps)))   # ~20 km margin
+```
+
+**Stop here if** there are many > 8 km used steps concentrated in one or two collars. Drop those fixes and regenerate steps before going on.
+
+## Build the feature lines
+
+```{r lines}
+fences    <- if (!is.null(FENCE_VEC)) st_read(FENCE_VEC, quiet = TRUE) |> prep_lines(bb_pop) else NULL
+perennial <- st_read(PERENNIAL,  quiet = TRUE) |> prep_lines(bb_pop)
+
+# Ephemeral rivers: same rule as West and the earlier maps.
+# If read_hr() is loaded, this matches the earlier West check exactly
+# (bb_west_hr = the bbox object you passed to read_hr() before).
+if (exists("read_hr") && exists("bb_west_hr")) {
+  ephemeral <- read_hr(bb_west_hr, min_upland = 1000) |>
+    filter(DIS_AV_CMS < 10) |> prep_lines(bb_pop)
+} else {
+  bb_ll <- st_as_text(st_transform(bb_pop, 4326))
+  ephemeral <- st_read(HR_AFRICA, layer = HR_LAYER, wkt_filter = bb_ll, quiet = TRUE) |>
+    filter(UPLAND_SKM >= 1000, DIS_AV_CMS < 10) |> prep_lines(bb_pop)
+}
+# West has no perennial rivers in range: any segment the discharge filter calls perennial is merged into ephemeral
+std <- function(x) { x <- st_cast(x, "MULTILINESTRING"); st_geometry(x) <- "geometry"; x }
+if (nrow(perennial) > 0) {
+  cat("Merging", nrow(perennial), "'perennial' segments into ephemeral (check them on the map)\n")
+  ephemeral <- rbind(std(ephemeral), std(perennial))
+  perennial <- perennial[0, ]
+}
+stopifnot(!any(st_is_empty(ephemeral)))
+roads <- if (!is.null(ROAD_PATH)) st_read(ROAD_PATH, quiet = TRUE) |> prep_lines(bb_pop) else NULL
+
+fence_cells_pop <- global(crop(fence_r, vect(bb_pop)) > 0, "sum", na.rm = TRUE)[1, 1]
+cat("Fence cells in West extent:", fence_cells_pop, " fence vector:", if (is.null(fences)) "none (raster crossings)" else nrow(fences),
+    " perennial:", nrow(perennial), " ephemeral:", nrow(ephemeral),
+    " roads:", if (is.null(roads)) "raster kept" else nrow(roads), "\n")
+stopifnot(fence_cells_pop > 0, nrow(ephemeral) > 0)
+
+st_write(ephemeral, here("data", "Linear_features", "west_ephemeral_rivers_hydrorivers_1k.gpkg"),
+         delete_dsn = TRUE, quiet = TRUE)
+```
+
+## Checkpoint 2: map before extracting
+
+Check the gold lines follow the riverbeds West elephants use (Hoarusib, Hoanib, Huab, Ugab) and match your earlier `west_ephemeral_rivers_hydrorivers_1k.gpkg`. Blue (perennial) should be empty or only the Kunene at the edge; if any blue line runs through the range, merge it into ephemeral the way we did for Etosha.
+
+```{r map, fig.width = 10, fig.height = 7}
+fence_pts <- crop(fence_r, vect(bb_pop)) |> as.points() |> st_as_sf()
+names(fence_pts)[1] <- "v"
+fence_pts <- filter(fence_pts, v > 0)
+
+ggplot() +
+  geom_sf(data = ephemeral, colour = "goldenrod", linewidth = 0.3) +
+  geom_sf(data = perennial, colour = "steelblue", linewidth = 0.6) +
+  geom_sf(data = fence_pts, colour = "red", size = 0.2) +
+  coord_sf(crs = crs_steps) + theme_minimal() +
+  labs(title = "West: new fences (red), perennial rivers (blue), ephemeral rivers (gold)")
+ggsave(here("outputs", "figures", "west_v2_linear_features.png"), width = 10, height = 7, dpi = 200)
+```
+
+## Distance rasters and extraction
+
+```{r dist-rasters}
+# fence_dist_r comes straight from Marissa's dist_vetfences_500m.tif (loaded in `paths`)
+eph_dist_r   <- dist_raster(ephemeral)
+writeRaster(eph_dist_r,  here("data", "Linear_features", "west_ephemeral_rivers_dist_1k_500m.tif"), overwrite = TRUE)
+```
+
+```{r extract}
+for (s in names(STEP_FILES)) {
+  cat("\n==", s, "==\n")
+  d <- readRDS(STEP_FILES[[s]]) |> standardize_cols()
+  # drop strata whose used step is > 8 km/h (GPS error; MET23/MET42 in West)
+  bad_strata <- d[[STRATA_COL]][d$case_ == 1 & d$sl_m > 8000]
+  d <- d[!d[[STRATA_COL]] %in% bad_strata, ]
+  cat("Dropped", length(bad_strata), "strata with used steps > 8 km\n")
+  d <- d[d$id != "MET42", ]
+  cat("Rows after dropping MET42:", nrow(d), "\n")
+  xy <- cbind(d$x2_, d$y2_)
+
+  # keep the old raster-based values for comparison
+  d <- d |> rename(any_of(c(fence_dist_old = "fence_dist", fence_cross_r500 = "fence_cross",
+                            river_cross_r500 = "river_cross")))
+
+  # endpoint distances (km, so coefficients are readable; match however your other dist terms are scaled)
+  d$fence_dist             <- terra::extract(fence_dist_r, xy)[, 1] / 1000
+  d$ephemeral_rivers_dist  <- terra::extract(eph_dist_r,  xy)[, 1] / 1000
+  d$ephemeral_rivers_prox  <- exp(-d$ephemeral_rivers_dist)   # = exp(-d_m / 1000), same as West
+
+  # vector crossings
+  cat("fences\n")
+  if (!is.null(fences)) {
+    d$fence_cross <- cross_vec(d, fences)
+  } else {
+    fc <- cross_rast(d, fence_r)
+    d$fence_cross_any <- fc$any
+    d$fence_cross     <- fc$strict   # model uses strict; compare counts with _any and _r500 at checkpoint 3
+  }
+  cat("perennial\n"); d$river_cross     <- cross_vec(d, perennial)
+  cat("ephemeral\n"); d$ephemeral_cross <- cross_vec(d, ephemeral)
+  if (!is.null(roads)) {
+    d <- d |> rename(any_of(c(road_cross_r500 = "road_cross")))
+    cat("roads\n"); d$road_cross <- cross_vec(d, roads)
+  }
+
+  stopifnot(!anyNA(d$fence_dist), !anyNA(d$ephemeral_rivers_dist))
+  saveRDS(d, here("outputs", sprintf("ele_trk_extract_west_%s_v2.rds", s)))
+  rm(d); gc()
+}
+```
+
+## Checkpoint 3: crossing counts and collinearity
+
+```{r check-cross}
+cross_summary <- map_dfr(names(STEP_FILES), function(s) {
+  d <- readRDS(here("outputs", sprintf("ele_trk_extract_west_%s_v2.rds", s)))
+  out <- d |>
+    select(case_, any_of(c("fence_cross", "fence_cross_any", "fence_cross_r500","river_cross", "river_cross_r500",
+                           "ephemeral_cross", "road_cross"))) |>
+    pivot_longer(-case_, names_to = "term", values_to = "x") |>
+    group_by(term, case_) |> summarise(n_cross = sum(x, na.rm = TRUE), rate = mean(x, na.rm = TRUE), .groups = "drop") |>
+    pivot_wider(names_from = case_, values_from = c(n_cross, rate), names_glue = "{.value}_{ifelse(case_ == 1, 'used', 'random')}") |>
+    mutate(season = s, ratio_used_random = rate_used / rate_random)
+  rm(d); gc(); out
+})
+cross_summary |> arrange(term, season) |> print(n = Inf)
+```
+
+How to read it: `ratio_used_random` near 1 means no barrier, well below 1 means a barrier. Vector counts should be **lower** than the `_r500` versions (the raster counted near-misses). Any term with fewer than `MIN_USED_CROSS` used crossings in a season gets dropped from that season's model below.
+
+```{r check-cor}
+d <- readRDS(here("outputs", "ele_trk_extract_west_dry_v2.rds")) |> slice_sample(n = 200000)
+cand <- intersect(c("ephemeral_rivers_dist", "ephemeral_rivers_prox", "ephemeral_cross", "water_rivers_dist",
+                    "river_cross", "road_cross", "road_dist", "fence_dist", "fence_cross"), names(d))
+cm <- cor(d[, cand], use = "pairwise.complete.obs")
+print(round(cm, 2))
+flag <- which(abs(cm) > 0.6 & upper.tri(cm), arr.ind = TRUE)
+if (nrow(flag)) { cat("\n|r| > 0.6:\n"); print(tibble(a = rownames(cm)[flag[, 1]], b = colnames(cm)[flag[, 2]], r = cm[flag])) }
+rm(d); gc()
+```
+
+(`ephemeral_rivers_dist` and `_prox` will correlate with each other. That's fine, since they're never in the same model.)
+
+## Fit models
+
+**Match `hab_terms` to the West main model in `linear_features_ssf_west.Rmd`** (West = Etosha main model; check). The list below is the KAZA one: edit it if needed.
+
+```{r fit}
+hab_terms  <- c("elevation", "slope", "aspect", "evi", "world_pop", "tree_cover", "shrubland",
+                "grassland", "water_rivers_dist", "cropland_dist", "urban_dist")
+dist_terms <- c("road_dist", "fence_dist")
+
+fit_one <- function(terms, d) {
+  f <- reformulate(c(terms, sprintf("strata(%s)", STRATA_COL)), response = "case_")
+  clogit(f, data = d, model = FALSE)
+}
+
+tidy_ci <- function(m) {
+  s <- summary(m)$coefficients; ci <- confint(m)
+  tibble(term = rownames(s), coef = s[, "coef"], se = s[, "se(coef)"],
+         exp_coef = exp(s[, "coef"]), lo95 = exp(ci[, 1]), hi95 = exp(ci[, 2]), p = s[, "Pr(>|z|)"])
+}
+
+results <- list()
+for (s in names(STEP_FILES)) {
+  cat("\n== fitting", s, "==\n")
+  d <- readRDS(here("outputs", sprintf("ele_trk_extract_west_%s_v2.rds", s)))
+
+  # which crossing terms have enough data this season
+  cs <- cross_summary |> filter(season == s)
+  enough <- function(t) isTRUE(cs$n_cross_used[cs$term == t] >= MIN_USED_CROSS)
+  cross_terms <- c("road_cross", if (enough("river_cross")) "river_cross", if (enough("fence_cross")) "fence_cross")
+  cat("Crossing terms used:", paste(cross_terms, collapse = ", "), "\n")
+  if (!enough("ephemeral_cross")) warning("Too few ephemeral crossings in ", s)
+
+  base <- c(hab_terms, dist_terms, cross_terms)
+  specs <- list(
+    `1. base (new fences, vector crossings)` = base,
+    `2. + eph dist`                          = c(base, "ephemeral_rivers_dist"),
+    `3. + eph prox`                          = c(base, "ephemeral_rivers_prox"),
+    `4. + eph dist + eph cross`              = c(base, "ephemeral_rivers_dist", "ephemeral_cross"),
+    `5. + eph prox + eph cross`              = c(base, "ephemeral_rivers_prox", "ephemeral_cross")
+  )
+  fits <- map(specs, fit_one, d = d)
+
+  aic_tab <- tibble(season = s, model = names(fits),
+                    AIC = map_dbl(fits, AIC), BIC = map_dbl(fits, BIC)) |>
+    mutate(dAIC = AIC - min(AIC), dBIC = BIC - min(BIC))
+
+  # step-length check on the best ephemeral model
+  best_eph <- aic_tab |> filter(model != names(specs)[1]) |> slice_min(AIC) |> pull(model)
+  m_sl  <- fit_one(c(specs[[best_eph]], "sl_m", "log_sl_m"), d)
+  shift <- tidy_ci(fits[[best_eph]]) |> select(term, coef, se) |>
+    inner_join(tidy_ci(m_sl) |> select(term, coef_sl = coef), by = "term") |>
+    mutate(season = s, shift_move_se = (coef_sl - coef) / se)
+
+  results[[s]] <- list(aic = aic_tab,
+                       coefs = imap_dfr(fits, ~ tidy_ci(.x) |> mutate(model = .y, season = s)),
+                       shift = shift, best_eph = best_eph)
+  rm(d, fits, m_sl); gc()
+}
+saveRDS(results, here("outputs", "west_ssf_v2_results.rds"))
+```
+
+## Results
+
+```{r results}
+aic_all <- map_dfr(results, "aic"); print(aic_all)
+
+# the terms the team asked about
+map_dfr(results, "coefs") |>
+  filter(str_detect(term, "ephemeral|fence|river_cross|road_cross")) |>
+  arrange(season, model, term) |> print(n = Inf)
+
+# step-length robustness: |shift| < 2 SE = robust
+map_dfr(results, "shift") |> filter(str_detect(term, "cross|ephemeral")) |> print(n = Inf)
+
+# do the habitat coefficients move when ephemeral terms are added? (base vs best)
+map_dfr(names(results), function(s) {
+  cf <- results[[s]]$coefs
+  inner_join(cf |> filter(model == "1. base (new fences, vector crossings)") |> select(term, coef, se),
+             cf |> filter(model == results[[s]]$best_eph) |> select(term, coef_eph = coef), by = "term") |>
+    mutate(season = s, shift_se = (coef_eph - coef) / se)
+}) |> filter(term %in% hab_terms) |> arrange(desc(abs(shift_se))) |> print()
+```
+
+**Reading it for team:**
+
+- **"No proximity effect"** = the dist/prox coefficient has a small effect size and a tight CI. With ~400k strata a tiny effect can still be "significant," so report the size, not just p.
+- **"Not a barrier"** = exp(coef) for `ephemeral_cross` with a 95% CI close to 1 (e.g. 0.9–1.1). A wide CI is "can't tell," not "no barrier."
+- **dist vs prox:** compare models 2 vs 3 (and 4 vs 5). If prox wins or ties, use prox so all three populations match West.
+- **Old vs new AIC:** only compare models fit to the same rows. Not comparable across populations.
+
+## Save the final model (prox + cross)
+
+```{r save-final}
+for (s in c("wet", "dry")) {
+  d <- readRDS(here("outputs", sprintf("ele_trk_extract_west_%s_v2.rds", s)))
+  cs <- cross_summary |> filter(season == s)
+  enough <- function(t) isTRUE(cs$n_cross_used[cs$term == t] >= MIN_USED_CROSS)
+  terms <- c(hab_terms, dist_terms, "road_cross",
+             if (enough("river_cross")) "river_cross", if (enough("fence_cross")) "fence_cross",
+             "ephemeral_rivers_prox", "ephemeral_cross")
+  f <- reformulate(c(terms, sprintf("strata(%s)", STRATA_COL)), response = "case_")
+  environment(f) <- globalenv()            # keeps the step data out of the saved file
+  m <- clogit(f, data = d, model = FALSE)
+  rm(d); gc()
+  m[c("y", "residuals", "linear.predictors")] <- NULL
+  attr(m$terms, ".Environment") <- globalenv()
+  saveRDS(m, here("outputs", sprintf("west_ssf_v2_final_%s.rds", s)))
+  cat(s, round(file.size(here("outputs", sprintf("west_ssf_v2_final_%s.rds", s))) / 1e6, 1), "MB\n")
+  rm(m); gc()
+}
+
+eph_prox_r <- exp(-rast(here("data", "Linear_features", "west_ephemeral_rivers_dist_1k_500m.tif")) / 1000)
+names(eph_prox_r) <- "ephemeral_rivers_prox"
+writeRaster(eph_prox_r, here("data", "Linear_features", "west_ephemeral_rivers_prox_1k_500m.tif"), overwrite = TRUE)
+```
