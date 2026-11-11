@@ -813,6 +813,18 @@ map_dfr(names(results), function(s) {
     mutate(season = s, shift_se = (coef_eph - coef) / se)
 }) |> filter(term %in% hab_terms) |> arrange(desc(abs(shift_se))) |> print()
 ```
+```{r}
+  for (s in names(STEP_FILES)) {
+    d <- readRDS(here("outputs", sprintf("ele_trk_extract_kaza_%s_v2.rds", s)))
+    terms <- c(hab_terms, dist_terms, "road_cross", "river_cross", "fence_cross",
+               "ephemeral_rivers_prox", "ephemeral_cross")
+    m <- fit_one(terms, d)
+    m$residuals <- m$linear.predictors <- NULL   # drop the 4M-length vectors; coefs and vcov stay
+    saveRDS(m, here("outputs", sprintf("kaza_ssf_v2_model5_%s.rds", s)))
+    rm(d, m); gc()
+  }
+```
+
 
 **Reading it for the team:**
 
