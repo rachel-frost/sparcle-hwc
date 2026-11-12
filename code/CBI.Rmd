@@ -1,0 +1,418 @@
+---
+title: "SSF_Validation"
+author: "Marissa Brenner"
+date: "2026-10-15"
+output: html_document
+---
+#==============================================
+#Boyce Cross-Validation
+#==============================================
+```{r}
+#===============================
+#Boyce Cross-Validation 
+#===============================
+
+# =============================================================================
+# CONTINUOUS BOYCE INDEX VALIDATION FOR Etosha and KAZA (and Western when its model is updated)
+# =============================================================================
+
+
+#0. Packages
+library(tidyverse)
+library(survival)   # clogit()
+library(modEvA)     # Boyce()
+library(here)
+
+set.seed(123)       # fold assignment is random
+
+
+#0b. Settings
+# NEW: choose which populations to run. West is switched off until its updated model/extraction exists
+# (add "West" back here later; its old cached results in outputs/boyce are not touched).
+# NEW: folder that holds the _v2.rds files
+data_dir <- here("data", "ele_trk_data")
+run_pops <- c("Etosha", "KAZA", "West")   # any of "Etosha", "KAZA", "West"
+
+# NEW: crossing terms with fewer used crossings than this in EITHER season are dropped for that
+# population (a term with ~0 used crossings in a training fold gives a runaway coefficient).
+# 50 = same rule as the v2 rerun in the SSF scripts (MIN_USED_CROSS).
+min_used_cross <- 50
+
+
+#1. Where the extracted step data live, and how to load them 
+# NEW: Etosha and KAZA both come from the v2 extractions (new vet fences, vector-intersection crossings,
+# new fence_dist). They are seasonal files, each already with a `season` column and step_id_ unique per elephant.
+# The v2 files ALREADY contain fence_cross / road_cross / river_cross, so crossings are NOT rebuilt from
+# the old *_linear columns (that would overwrite the new vector crossings).
+# NEW: data are no longer all loaded up front. Each population is loaded inside the loop (section 7),
+# trimmed to the columns needed, and dropped afterwards (KAZA + Etosha together is a lot of RAM).
+# West must be rerun through extract_lc_mixed() so it has grassland/shrubland/tree_cover.
+lin_cols <- c("kaza_vet_fences_linear", "roads_linear", "hydrorivers_linear")
+
+# crossing indicators from the old 500 m *_linear columns; only used for West (not updated yet)
+add_crossings <- function(d) {
+  stopifnot(all(lin_cols %in% names(d)))
+  d |>
+    as_tibble() |>
+    mutate(
+      across(all_of(lin_cols), ~ if_else(is.infinite(.x) | is.na(.x), 0, .x)),  # -Inf/NA = no feature
+      fence_cross = as.integer(kaza_vet_fences_linear > 0),
+      road_cross  = as.integer(roads_linear > 0),
+      river_cross = as.integer(hydrorivers_linear > 0)
+    )
+}
+
+
+#2. Choose covariates and settings
+# NEW: base_vars = everything except core_dist; cross_vars = crossing indicators
+base_vars  <- c("fence_dist", "road_dist", "water_rivers_dist",
+                "cropland_dist", "grassland", "shrubland", "urban_dist",
+                "tree_cover", "elevation", "slope", "aspect", "evi", "world_pop")
+cross_vars <- c("fence_cross", "road_cross", "river_cross")
+
+# NEW: load one population, keeping only the columns the models need (saves memory)
+load_pop <- function(cfg) {
+  keep <- unique(c("id", "step_id_", "case_", "season", base_vars, cross_vars, cfg$extra, lin_cols))
+  d <- imap(cfg$paths, function(p, nm) {
+    if (!file.exists(p)) stop("File not found: ", p, call. = FALSE)   # shows which path is wrong
+    x <- readRDS(p) |> as_tibble() |> select(any_of(keep))
+    if (!"season" %in% names(x)) x$season <- nm      # seasonal files: take season from the name
+    x
+  }) |> bind_rows()
+
+  # NEW: make step_id_ unique across elephants (same rule as prep_season in the KAZA SSF script):
+  # only prefix with the elephant id if it isn't already prefixed (Etosha v2 already is)
+  prefixed <- all(startsWith(as.character(d$step_id_), paste0(d$id, "_")))
+  if (!prefixed) d <- d |> mutate(step_id_ = paste(id, step_id_, sep = "_"))
+
+  if (cfg$recompute_cross) d <- add_crossings(d) else stopifnot(all(cross_vars %in% names(d)))
+  d |> select(-any_of(lin_cols))
+}
+
+#Etosha dropped core_dist because most Etosha steps are inside the core area.
+# KAZA's SSF also has no core_dist, so only West adds it back via `extra`.
+# NEW: the three linear-feature scenarios are built from base_vars. `cross_keep` = the crossing
+# terms that have enough used crossings for this population (see min_used_cross above).
+make_scenarios <- function(extra = character(0), cross_keep = cross_vars) {
+  # each crossing term replaces its own distance-to term (river_cross has no pair)
+  pairs    <- c(fence_cross = "fence_dist", road_cross = "road_dist")
+  replaced <- unname(pairs[intersect(names(pairs), cross_keep)])
+  scn <- list(
+    dist_only       = c(extra, base_vars),                                   # 1. distance-to only
+    dist_plus_cross = c(extra, base_vars, cross_keep),                       # 2. distance-to + crossings
+    cross_only      = c(extra, setdiff(base_vars, replaced), cross_keep)     # 3. crossings replace fence/road distance
+  )
+  scn[!duplicated(map(scn, sort))]     # if no crossing terms survive, drop the duplicate scenarios
+}
+
+# NEW: per-population settings. recompute_cross: TRUE = build crossings from the *_linear columns;
+# FALSE = the file already has them (v2 files).
+pops <- list(
+  Etosha = list(paths = c(wet = file.path(data_dir, "ele_trk_extract_etosha_wet_v2.rds"),
+                          dry = file.path(data_dir, "ele_trk_extract_etosha_dry_v2.rds")),
+                extra = character(0), fill_lc_na = TRUE, recompute_cross = FALSE),
+  KAZA   = list(paths = c(wet = file.path(data_dir, "ele_trk_extract_kaza_wet_v2.rds"),
+                          dry = file.path(data_dir, "ele_trk_extract_kaza_dry_v2.rds")),
+                extra = character(0), fill_lc_na = TRUE, recompute_cross = FALSE),
+  West   = list(paths = c(wet = file.path(data_dir, "ele_trk_extract_west_wet_v2.rds"),
+                          dry = file.path(data_dir, "ele_trk_extract_west_dry_v2.rds")),
+                extra = character(0),  fill_lc_na = TRUE, recompute_cross = FALSE)
+)[run_pops]
+
+k_folds <- 5     #number of CV folds (capped at the number of elephants)
+bin_width <- 0.1   #moving-window width, in units of the prediction scale
+n_windows <- 100   #number of window positions along the gradient (modEvA `res`)
+pred_scale <- "rank"  # "rank" or "lp" -- see section 5 for the decision
+n_per_stratum <- 11   # 1 used + 10 random steps
+
+boyce_dir <- here("outputs", "boyce")   # NEW: per-model cache folder
+dir.create(boyce_dir, showWarnings = FALSE)
+
+
+#3.Prepare a season-specific dataset 
+prep_data <- function(trk, season_label, vars, fill_lc_na = FALSE) {
+
+  stopifnot(all(vars %in% names(trk)))   # NEW: fails loudly if columns are missing (e.g. West without lcmixed)
+
+  d <- trk |>
+    as_tibble() |>                       # drop the amt track class; plain tibble is safer
+    filter(season == season_label)
+
+  # NEW: step_id_ must be unique across elephants, or whole-elephant folds would split strata
+  stopifnot(nrow(distinct(d, step_id_, id)) == n_distinct(d$step_id_))
+
+  # In Etosha pipeline set missing binary land cover to 0 (pixels outside the land-cover raster). Keep that here.
+  if (fill_lc_na) {
+    d <- d |> mutate(across(c(grassland, shrubland, tree_cover), ~ replace_na(.x, 0)))
+  }
+
+  d |>
+    #The same complete rows must be used to fit and to score, so drop NAs in any model covariate up front.
+    # NEW: `vars` is the union across all scenarios so every scenario uses identical rows.
+    drop_na(all_of(vars)) |>
+    # Dropping rows can orphan a stratum (case removed but controls kept, or
+    # vice versa). A stratum needs >= 1 case and >= 1 control to be informative.
+    group_by(step_id_) |>
+    filter(any(case_), any(!case_)) |>
+    ungroup()
+}
+
+
+#4.Assign whole elephants to folds
+# NEW: now called once per population x season (outside run_ssf_boyce) so all scenarios share folds
+make_folds <- function(data, k) {
+  ids <- unique(data$id)
+  k   <- min(k, length(ids))             #can't have more folds than animals
+  fold_tbl <- tibble(id = sample(ids),   #shuffle animals, then deal into folds
+                     fold = rep_len(seq_len(k), length(ids)))
+  left_join(data, fold_tbl, by = "id")
+}
+
+
+#Fit the SSF and score new steps
+fit_ssf <- function(train, vars) {
+  f <- reformulate(c(vars, "strata(step_id_)"), response = "case_")
+  # With one used step per stratum, method = "efron" gives the same estimates
+  # as clogit's default "exact", but is much faster on millions of rows.
+  clogit(f, data = train, method = "efron")
+}
+
+# Linear predictor for new data: X %*% beta (log relative selection strength).
+score_steps <- function(fit, newdata) {
+  b <- coef(fit)
+  b <- b[!is.na(b)]
+  X <- as.matrix(newdata[, names(b)])
+  drop(X %*% b)
+}
+
+
+#6.Cross-validated Boyce for one model
+# NEW: `data` already has a fold column; `meta` carries population/season/scenario labels
+run_ssf_boyce <- function(data, vars, label, meta) {
+
+  folds <- sort(unique(data$fold))
+  oof   <- list()   #out-of-fold predictions, kept for the pooled plot
+  res   <- list()   #one row of summary stats per fold
+
+  for (f in folds) {
+    message(label, ": fold ", f, " of ", length(folds))
+
+    train <- filter(data, fold != f)
+    test  <- filter(data, fold == f)
+
+    fit <- fit_ssf(train, vars)
+    test$lp <- score_steps(fit, test)      # log-RSS of every held-out step
+
+
+    #Scale is "rank": Converts the linear predictor into a uniform percentile rank from 0 to 1. Every window gets a roughly equal number of data points, making the P/E ratio stable across the gradient. Boyce is rank-based anyway (Spearman).
+    test$pred <- if (pred_scale == "rank") percent_rank(test$lp) else test$lp
+
+    #`obs` must be numeric 0/1 (1 = used step, 0 = random step).
+    #modEvA compares predictions at used steps against predictions across
+    #ALL steps, i.e. presence vs "available".
+    b <- Boyce(obs = as.numeric(test$case_),
+               pred = test$pred,
+               n.bins = NA,                # NA = continuous moving window
+               bin.width = if (pred_scale == "rank") bin_width else "default",
+               res = n_windows,
+               method = "spearman",
+               rm.dup.classes = FALSE,
+               plot = FALSE)
+
+    res[[f]] <- tibble(
+      meta,                                # NEW: population / season / scenario
+      label = label, fold = f,
+      n_elephants = n_distinct(test$id),
+      n_used_steps = sum(test$case_),
+      boyce = b$B,
+      #modEvA flags windows with < 30 points (their P/E ratio is noisy)
+      n_small_bins = sum(b$bins$bin.N < 30, na.rm = TRUE)
+    )
+    oof[[f]] <- test |> select(step_id_, case_, lp, pred, fold)
+    rm(train, test, fit); gc()             # NEW: free memory between folds
+  }
+
+  oof <- bind_rows(oof)
+
+  #Pooled out-of-fold P/E curve
+  # A good model gives a monotonically increasing curve. Pooling predictions across folds gives one curve per model.
+  Boyce(obs = as.numeric(oof$case_), pred = oof$pred,
+        bin.width = if (pred_scale == "rank") bin_width else "default",
+        res = n_windows, plot = TRUE,
+        main = paste("Boyce (out-of-fold):", label))
+
+  #Check: within-stratum rank of the used step 
+  # Because an SSF compares each used step to ITS OWN random steps, also ask:
+  # where does the used step rank among the steps in its stratum?
+  # (Fortin et al. 2009-style). If the model works, used steps should land at
+  # the high ranks far more often than the 1/n expected by chance.
+  # NEW: uncommented, and n_per_stratum replaces the max(table(...)) lookup (slow on millions of rows);
+  # complete() fills ranks with zero counts so the correlation is always over 1:11
+  strata_check <- oof |>
+    group_by(step_id_) |>
+    filter(n() == n_per_stratum) |>                # keep complete strata (e.g. 11 steps)
+    mutate(rank_in_stratum = rank(lp, ties.method = "random")) |>  #method for ranking steps. So when there are steps of identical score, this tie is shuffles them so that they are equally likely to land at any position in it rather than "first" which ranks whichever step comes first which is always the used which gets ranked lowest everytime then.  
+    ungroup() |>
+    filter(case_) |>
+    count(rank_in_stratum, name = "n_used") |>
+    complete(rank_in_stratum = 1:n_per_stratum, fill = list(n_used = 0))
+
+  within_stratum_rho <- cor(strata_check$rank_in_stratum, strata_check$n_used,
+                            method = "spearman")
+
+  list(label = label,
+       folds = bind_rows(res),
+       oof = oof,
+       within_stratum_counts = strata_check,
+       within_stratum_rho = within_stratum_rho)
+}
+
+
+#7. Run for each population x season 
+# NEW: also x scenario; each result is cached so reruns skip finished models
+# NEW: each population is loaded here, then released before the next one.
+# NOTE: cached results are reused by name (e.g. "KAZA_wet_dist_only.rds"). If you change the crossing
+# terms, input files, or covariates, delete the matching files in outputs/boyce so they are refit.
+boyce_results <- list()
+
+for (pop in names(pops)) {
+  cfg <- pops[[pop]]
+  message("Loading ", pop, " ...")
+  pop_dat <- load_pop(cfg)
+
+  # NEW: which crossing terms have enough USED crossings (in both seasons) to be estimated?
+  used_cross <- pop_dat |>
+    filter(case_) |>
+    group_by(season) |>
+    summarise(across(all_of(cross_vars), ~ sum(.x, na.rm = TRUE)), n_used = n(), .groups = "drop")
+  print(used_cross)
+  cross_keep <- cross_vars[map_lgl(cross_vars, ~ min(used_cross[[.x]]) >= min_used_cross)]
+  if (length(setdiff(cross_vars, cross_keep)))
+    message(pop, ": dropping crossing terms with < ", min_used_cross, " used crossings: ",
+            paste(setdiff(cross_vars, cross_keep), collapse = ", "))
+
+  scn      <- make_scenarios(cfg$extra, cross_keep)
+  all_vars <- unique(unlist(scn))
+
+  for (szn in c("wet", "dry")) {
+    d <- prep_data(pop_dat, szn, all_vars, fill_lc_na = cfg$fill_lc_na)
+
+    set.seed(123)                      # NEW: same fold assignment for every scenario
+    d <- make_folds(d, k_folds)
+
+    for (sc in names(scn)) {
+      label <- paste(pop, szn, sc)
+      path  <- file.path(boyce_dir, paste0(gsub(" ", "_", label), ".rds"))
+
+      if (file.exists(path)) {
+        boyce_results[[label]] <- readRDS(path)
+      } else {
+        meta <- tibble(population = pop, season = szn, scenario = sc)
+        boyce_results[[label]] <- run_ssf_boyce(d, scn[[sc]], label, meta)
+        saveRDS(boyce_results[[label]], path)
+      }
+    }
+    rm(d); gc()
+  }
+  rm(pop_dat); gc()
+}
+
+
+#8. Summarise 
+# Per-fold Boyce, then mean and SD across folds for each model.
+fold_table <- map_dfr(boyce_results, "folds")
+fold_table
+
+summary_table <- fold_table |>
+  group_by(population, season, scenario) |>
+  summarise(mean_boyce = mean(boyce),
+            sd_boyce   = sd(boyce),
+            min_boyce  = min(boyce),
+            max_boyce  = max(boyce),
+            .groups = "drop") |>
+  left_join(tibble(label = names(boyce_results),
+                   within_stratum_rho = map_dbl(boyce_results, "within_stratum_rho")) |>
+              separate(label, c("population", "season", "scenario"), sep = " ", extra = "merge"),
+            by = c("population", "season", "scenario"))
+summary_table
+
+#Frequency of used steps at each within-stratum rank (should climb toward the top rank)
+map(boyce_results, "within_stratum_counts")
+
+
+# Column check (data are no longer kept in memory after the loop, so this loads each population).
+# Every covariate the models expect but the data lacks (should be character(0) for each):
+if (FALSE) {
+  for (pop in names(pops)) {
+    d <- load_pop(pops[[pop]])
+    cat(pop, "- missing:", setdiff(unique(unlist(make_scenarios(pops[[pop]]$extra))), names(d)), "\n")
+    rm(d); gc()
+  }
+}
+```
+
+```{r}
+here()                                           # the folder the script is looking in
+list.files(here("outputs"), pattern = "_v2\\.rds")   # should list the 4 files; character(0) = wrong folder
+```
+
+
+```{r}
+set.seed(123)
+rho_fixed <- map_dfr(boyce_results, function(r) {
+  sc <- r$oof |>
+    group_by(step_id_) |>
+    filter(n() == 11) |>
+    mutate(rank_in_stratum = rank(lp, ties.method = "random")) |>
+    ungroup() |>
+    filter(case_) |>
+    count(rank_in_stratum, name = "n_used") |>
+    complete(rank_in_stratum = 1:11, fill = list(n_used = 0))
+  tibble(label = r$label,
+         rho = cor(sc$rank_in_stratum, sc$n_used, method = "spearman"))
+})
+rho_fixed
+```
+
+```{r}
+# NEW: tie check now runs for every population/season (dist_only model), not just Etosha dry
+tie_check <- map_dfr(names(boyce_results)[str_detect(names(boyce_results), "dist_only$")], function(l) {
+  x <- boyce_results[[l]]$oof |>
+    group_by(step_id_) |>
+    summarise(n_unique = n_distinct(lp), .groups = "drop")
+  tibble(label = l,
+         share_all_identical = mean(x$n_unique == 1),   # share of strata where all 11 steps score identically
+         share_any_tie       = mean(x$n_unique < 11))   # share of strata with at least one tie
+})
+tie_check
+
+# Etosha dry result from before:
+# 6.2e-05: only about 0.006% of strata have all 11 steps scoring identically. Almost every stratum has some variation for the model to use.
+# 0.943: about 94% of strata have at least one tie among their 11 steps. Ties are everywhere, but mostly partial, such as two or three steps sharing a pixel.
+```
+
+6.2e-05: only about 0.006% of strata have all 11 steps scoring identically. Almost every stratum has some variation for the model to use.
+0.943: about 94% of strata have at least one tie among their 11 steps. Ties are everywhere, but mostly partial, such as two or three steps sharing a pixel.
+
+```{r}
+
+summary_table |>
+  mutate(label = paste(population, season, scenario)) |>
+  select(label, within_stratum_rho) |>
+  left_join(rho_fixed, by = "label") |>
+  rename(rho_first = within_stratum_rho, rho_random = rho)
+```
+
+The within-stratum result looks better than the Boyce result. That fits the idea that the SSF discriminates well within strata, while the pooled, cross-elephant Boyce is noisy because of variation between individuals.
+
+
+
+
+
+
+
+
+
+
+
+
