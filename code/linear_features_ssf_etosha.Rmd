@@ -1,0 +1,679 @@
+---
+title: "ssf_linear_features"
+author: "Rachel Frost"
+date: "2026-11-03"
+output: html_document
+---
+#Created so we can call on extracted steps and linear features and others can 
+#run it more easily 
+
+```{r setup}
+library(tidyverse)
+library(here)
+library(amt)
+library(survival)
+select <- dplyr::select
+```
+
+##1. Load extracted steps
+
+```{r load}
+combined_path <- here("outputs", "etosha_extract_hr1_lcmixed.rds")
+
+if (file.exists(combined_path)) {
+  ele_trk_extract_etosha <- readRDS(combined_path)
+} else {
+  etosha_dir <- list.files(here("data"), pattern = "^batch_output_etosha_hr1_lcmixed_",
+                           full.names = TRUE)
+  stopifnot(length(etosha_dir) == 1)
+  files <- list.files(etosha_dir, pattern = "pipeline_batch_.*\\.rds", full.names = TRUE)
+  ele_trk_extract_etosha <- map_dfr(files, readRDS)
+  saveRDS(ele_trk_extract_etosha, combined_path)
+}
+
+nrow(ele_trk_extract_etosha)  # 7,245,194
+```
+
+## 2. Prep: unique strata, crossing indicators, land cover NAs
+
+```{r prep}
+lin_cols <- c("kaza_vet_fences_linear", "roads_linear", "hydrorivers_linear")
+stopifnot(all(lin_cols %in% names(ele_trk_extract_etosha)))
+
+ele_trk_extract_etosha <- ele_trk_extract_etosha |>
+  mutate(
+    step_id_ = paste(id, step_id_, sep = "_"),          # avoid stratum collisions across ids
+    across(all_of(lin_cols), ~ if_else(is.infinite(.x) | is.na(.x), 0, .x)),  # -Inf/NA = no feature
+    fence_cross = as.integer(kaza_vet_fences_linear > 0),
+    road_cross  = as.integer(roads_linear > 0),
+    river_cross = as.integer(hydrorivers_linear > 0),    # any stream order (1-3)
+    across(c(grassland, shrubland, tree_cover), ~ replace_na(.x, 0))
+  )
+
+ele_trk_extract_etosha_wet <- ele_trk_extract_etosha |> filter(season == "wet")
+ele_trk_extract_etosha_dry <- ele_trk_extract_etosha |> filter(season == "dry")
+
+
+saveRDS(ele_trk_extract_etosha, here("outputs", "ele_trk_extract_etosha_linecross.rds"))
+```
+
+## 3. Checks: crossing counts and overlap with distance-to terms
+
+```{r checks}
+check_crossings <- function(d) {
+  list(
+    counts = d |> group_by(case_) |>
+      summarise(fence = sum(fence_cross), road = sum(road_cross), river = sum(river_cross)),
+    cor = c(fence = cor(d$fence_dist, d$fence_cross, use = "complete.obs"),
+            road  = cor(d$road_dist, d$road_cross, use = "complete.obs"),
+            river = cor(d$water_rivers_dist, d$river_cross, use = "complete.obs"))
+  )
+}
+
+check_crossings(ele_trk_extract_etosha_wet)
+check_crossings(ele_trk_extract_etosha_dry)
+```
+
+## 4. Fit main SSF + step-length robustness check
+
+Main model has no movement terms. The `slcheck` model adds `sl_` + `log_sl_` only to test
+whether crossing coefficients are confounded with step length; it is not the reported model.
+Note `sl_` is in degrees here (track built in EPSG:4326); fine for this comparison.
+
+Fitting is slow (~3.5M rows per season), so fits are cached.
+
+```{r fit}
+fits_path <- here("outputs", "etosha_ssf_crossing_fits.rds")
+
+f_main <- case_ ~ fence_dist + road_dist + water_rivers_dist +
+  cropland_dist + grassland + shrubland + urban_dist + tree_cover +
+  elevation + slope + aspect + evi + world_pop +
+  fence_cross + road_cross + river_cross + strata(step_id_)
+
+f_slcheck <- update(f_main, . ~ . + sl_ + log_sl_)
+
+fit_season <- function(d) {
+  d <- d |> mutate(log_sl_ = log(sl_))
+  list(main    = fit_clogit(d, f_main, model = FALSE),
+       slcheck = fit_clogit(d, f_slcheck, model = FALSE))
+}
+
+if (file.exists(fits_path)) {
+  etosha_fits <- readRDS(fits_path)
+} else {
+  etosha_fits <- list(wet = fit_season(ele_trk_extract_etosha_wet),
+                      dry = fit_season(ele_trk_extract_etosha_dry))
+  saveRDS(etosha_fits, fits_path)
+}
+
+summary(etosha_fits$wet$main)
+summary(etosha_fits$dry$main)
+```
+
+## 5. Robustness table
+
+`shift_over_se` = change in crossing coefficient when step length is added, in units of the
+main model's SE. |shift| < 1 SE = robust.
+
+```{r robustness}
+cross_terms <- c("fence_cross", "road_cross", "river_cross")
+
+robustness <- map_dfr(names(etosha_fits), function(s) {
+  m  <- summary(etosha_fits[[s]]$main)$coefficients[cross_terms, ]
+  sc <- summary(etosha_fits[[s]]$slcheck)$coefficients[cross_terms, ]
+  tibble(season = s, term = cross_terms,
+         coef_main = m[, "coef"], se_main = m[, "se(coef)"],
+         rel_sel_main = exp(m[, "coef"]),
+         coef_sl = sc[, "coef"],
+         shift_over_se = (sc[, "coef"] - m[, "coef"]) / m[, "se(coef)"])
+})
+robustness
+```
+
+## 6. Do crossings improve the model? (AIC/BIC, same rows)
+
+```{r aic}
+compare_crossing <- function(data, label) {
+  d <- data |>
+    drop_na(fence_dist, road_dist, water_rivers_dist, cropland_dist, urban_dist,
+            grassland, shrubland, tree_cover, elevation, slope, aspect, evi, world_pop,
+            fence_cross, road_cross, river_cross)
+
+  base  <- fit_clogit(d, update(f_main, . ~ . - fence_cross - road_cross - river_cross),
+                      model = FALSE)
+  cross <- fit_clogit(d, f_main, model = FALSE)
+
+  tibble(season = label, model = c("base", "+ crossings"),
+         AIC = c(AIC(base$model), AIC(cross$model)),
+         BIC = c(BIC(base$model), BIC(cross$model))) |>
+    mutate(dAIC = AIC - min(AIC), dBIC = BIC - min(BIC))
+}
+
+aic_path <- here("outputs", "etosha_crossing_aic.rds")
+if (file.exists(aic_path)) {
+  crossing_aic <- readRDS(aic_path)
+} else {
+  crossing_aic <- bind_rows(compare_crossing(ele_trk_extract_etosha_wet, "Etosha wet"),
+                            compare_crossing(ele_trk_extract_etosha_dry, "Etosha dry"))
+  saveRDS(crossing_aic, aic_path)
+}
+crossing_aic
+```
+## 7. Three linear-feature scenarios
+
+1. Distance-to only (`base` from section 6)
+2. Distance-to + crossings (`main` from section 4)
+3. Crossings replace distance-to for fences and roads (and rivers, via `river_cross`)
+
+`water_rivers_dist` is kept in scenario 3 by default: it comes from the land-cover water
+class (pans, waterholes), not the HydroRIVERS line layer, so it is mostly a water-access
+habitat effect. Set `drop_water <- TRUE` to also drop it.
+
+Only scenario 3 is fit here. Rows are filtered on the same variable set as section 6, so `n`
+matches across all three scenarios and AIC is comparable.
+
+```{r scenarios}
+drop_water <- FALSE
+
+f_cross_only <- update(f_main, . ~ . - fence_dist - road_dist)
+if (drop_water) f_cross_only <- update(f_cross_only, . ~ . - water_rivers_dist)
+
+fit_cross_only <- function(data) {
+  d <- data |>
+    drop_na(fence_dist, road_dist, water_rivers_dist, cropland_dist, urban_dist,
+            grassland, shrubland, tree_cover, elevation, slope, aspect, evi, world_pop,
+            fence_cross, road_cross, river_cross)
+  fit_clogit(d, f_cross_only, model = FALSE)
+}
+
+cross_only_path <- here("outputs", paste0("etosha_ssf_crossonly_fits",
+                                          if (drop_water) "_nowater", ".rds"))
+if (file.exists(cross_only_path)) {
+  cross_only_fits <- readRDS(cross_only_path)
+} else {
+  cross_only_fits <- list(wet = fit_cross_only(ele_trk_extract_etosha_wet),
+                          dry = fit_cross_only(ele_trk_extract_etosha_dry))
+  saveRDS(cross_only_fits, cross_only_path)
+}
+
+scenario_table <- map_dfr(c("wet", "dry"), function(s) {
+  label <- paste("Etosha", s)
+  prev  <- crossing_aic |> filter(season == label)
+  m3    <- cross_only_fits[[s]]$model
+  stopifnot(m3$n == etosha_fits[[s]]$main$model$n)   # same rows as scenarios 1-2
+
+  tibble(season = s,
+         scenario = c("1. distance-to only", "2. distance-to + crossings",
+                      "3. crossings replace distance-to"),
+         n   = m3$n,   # identical across scenarios (checked above; base used the same drop_na rows)
+         AIC = c(prev$AIC, AIC(m3)),
+         BIC = c(prev$BIC, BIC(m3))) |>
+    mutate(dAIC = AIC - min(AIC), dBIC = BIC - min(BIC))
+})
+scenario_table
+
+# crossing coefficients with vs without the distance-to terms
+map_dfr(c("wet", "dry"), function(s) {
+  tibble(season = s, term = cross_terms,
+         with_dist    = coef(etosha_fits[[s]]$main$model)[cross_terms],
+         without_dist = coef(cross_only_fits[[s]]$model)[cross_terms])
+})
+```
+
+```{r coef-compare}
+base_path <- here("outputs", "etosha_ssf_base_fits.rds")
+f_base <- update(f_main, . ~ . - fence_cross - road_cross - river_cross)
+
+if (file.exists(base_path)) {
+  base_fits <- readRDS(base_path)
+} else {
+  fit_base <- function(data) {
+    d <- data |>
+      drop_na(fence_dist, road_dist, water_rivers_dist, cropland_dist, urban_dist,
+              grassland, shrubland, tree_cover, elevation, slope, aspect, evi, world_pop,
+              fence_cross, road_cross, river_cross)
+    fit_clogit(d, f_base, model = FALSE)
+  }
+  base_fits <- list(wet = fit_base(ele_trk_extract_etosha_wet),
+                    dry = fit_base(ele_trk_extract_etosha_dry))
+  saveRDS(base_fits, base_path)
+}
+
+coef_compare <- map_dfr(c("wet", "dry"), function(s) {
+  b  <- coef(base_fits[[s]]$model)
+  m  <- coef(etosha_fits[[s]]$main$model)
+  mv <- coef(etosha_fits[[s]]$slcheck$model)
+  se <- sqrt(diag(vcov(etosha_fits[[s]]$main$model)))
+  terms <- names(m)
+  tibble(season = s, term = terms,
+         base = b[terms], with_cross = m, with_move = mv[terms], se_main = se,
+         shift_cross_se = (m - b[terms]) / se,     # effect of adding crossings
+         shift_move_se  = (mv[terms] - m) / se)    # effect of adding movement terms
+})
+
+coef_compare |> arrange(season, desc(abs(shift_cross_se)))
+coef_compare |> arrange(season, desc(abs(shift_move_se)))
+
+#concordance, just for reference only (we determined this is not model-selection criterion for matched designs)
+map_dfr(c("wet", "dry"), ~ tibble(
+  season = .x,
+  base       = summary(base_fits[[.x]])$concordance[1],
+  with_cross = summary(etosha_fits[[.x]]$main)$concordance[1],
+  with_move  = summary(etosha_fits[[.x]]$slcheck)$concordance[1]))
+```
+
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+##################################################################################
+
+## New Rerun 11/11 with updated vet fences and ephemeral rivers
+
+```{r setup}
+library(here)
+library(tidyverse)
+library(sf)
+library(terra)
+library(survival)
+if (!requireNamespace("sfheaders", quietly = TRUE)) install.packages("sfheaders")
+select <- dplyr::select
+filter <- dplyr::filter
+```
+
+```{r paths}
+library(here); library(tidyverse); library(sf); library(terra); library(survival)
+select <- dplyr::select
+filter <- dplyr::filter
+
+ETOSHA_ALL <- here("outputs", "ele_trk_extract_etosha_linecross.rds")
+SEASON_COL <- "season"
+STRATA_COL <- "step_id_"
+MIN_USED_CROSS <- 50
+STEP_FILES <- c(
+  wet = here("outputs", "ele_trk_extract_etosha_wet_input.rds"),
+  dry = here("outputs", "ele_trk_extract_etosha_dry_input.rds")
+)
+```
+
+```{r}
+file.remove(STEP_FILES[file.exists(STEP_FILES)])   # clears the broken wet file
+
+for (s in names(STEP_FILES)) {
+  all_steps <- readRDS(ETOSHA_ALL)
+  part <- all_steps[all_steps[[SEASON_COL]] == s, ] |> select(-any_of(c("terrain_list", "linear_list")))
+  rm(all_steps); gc()
+  stopifnot(nrow(part) > 0)
+  saveRDS(part, STEP_FILES[[s]])
+  n_check <- nrow(readRDS(STEP_FILES[[s]]))
+  cat(s, nrow(part), "rows saved,", n_check, "rows read back\n")
+  rm(part); gc()
+}
+```
+```{r}
+FENCE_RAST <- here("data", "Linear_features", "all_vet_fences", "vetfences_all_500m.tif")
+FENCE_DIST <- here("data", "Linear_features", "all_vet_fences", "dist_vetfences_500m.tif")
+FENCE_VEC  <- NULL   # set to Marissa's fence shapefile if she has one
+HR_AFRICA  <- here("data", "Linear_features", "HydroRIVERS_v10_af.gdb", "HydroRIVERS_v10_af.gdb")
+HR_LAYER   <- st_layers(HR_AFRICA)$name[1]
+PERENNIAL  <- here("data", "Linear_features", "hydrorivers_namibia_gte5.shp")
+ROAD_PATH  <- here("data", "Linear_features", "roads_selected_exported.shp")
+
+stopifnot(all(file.exists(STEP_FILES)), file.exists(FENCE_RAST), file.exists(FENCE_DIST),
+          dir.exists(HR_AFRICA), file.exists(PERENNIAL), file.exists(ROAD_PATH))
+
+# Etosha coordinates: lon/lat should be x ~14-18; UTM would be in the hundreds of thousands
+chk <- readRDS(STEP_FILES[["dry"]])
+cat("Etosha x range:", range(chk$x2_, na.rm = TRUE), "| y range:", range(chk$y2_, na.rm = TRUE), "\n")
+if (max(abs(chk$x2_), na.rm = TRUE) > 180)
+  stop("Etosha steps are projected, not lon/lat. Paste the ranges before continuing.")
+rm(chk); gc()
+
+crs_steps    <- "EPSG:4326"
+fence_r      <- rast(FENCE_RAST)
+fence_dist_r <- rast(FENCE_DIST)
+tmpl         <- fence_r
+stopifnot(same.crs(fence_r, crs_steps), compareGeom(fence_r, fence_dist_r, stopOnError = FALSE))
+print(freq(fence_r))
+
+sf_use_s2(FALSE)
+```
+
+
+## Helpers
+
+```{r helpers}
+# clean_names() may have stripped amt's trailing underscores, so look for either version
+pick_col <- function(d, opts) {
+  hit <- intersect(opts, names(d))
+  if (length(hit) == 0) stop("None of these columns found: ", paste(opts, collapse = ", "))
+  hit[1]
+}
+
+standardize_cols <- function(d) {
+  map <- c(x1_ = pick_col(d, c("x1_", "x1")), y1_ = pick_col(d, c("y1_", "y1")),
+           x2_ = pick_col(d, c("x2_", "x2")), y2_ = pick_col(d, c("y2_", "y2")),
+           case_ = pick_col(d, c("case_", "case")), sl_ = pick_col(d, c("sl_", "sl")))
+  # coordinates are degrees, so amt's sl_ is in degrees too. Step length in metres (good approximation at 1-hr steps):
+  d |> rename(any_of(setNames(map, names(map)))) |>
+    mutate(sl_m = sqrt(((x2_ - x1_) * 111320 * cos((y1_ + y2_) / 2 * pi / 180))^2 +
+                       ((y2_ - y1_) * 110574)^2),
+           log_sl_m = log(pmax(sl_m, 1)))
+}
+
+# Step lines in batches -> TRUE if the step line intersects any feature line
+cross_vec <- function(d, lines, batch = 250000) {
+  out <- logical(nrow(d))
+  idx <- split(seq_len(nrow(d)), ceiling(seq_len(nrow(d)) / batch))
+  for (i in seq_along(idx)) {
+    ii <- idx[[i]]
+    ok <- ii[d$sl_[ii] > 0 & !is.na(d$x2_[ii])]   # zero-length / NA steps can't cross
+    if (length(ok)) {
+      df <- tibble(id = rep(seq_along(ok), each = 2),
+                   x  = as.vector(rbind(d$x1_[ok], d$x2_[ok])),
+                   y  = as.vector(rbind(d$y1_[ok], d$y2_[ok])))
+      sl <- sfheaders::sf_linestring(df, x = "x", y = "y", linestring_id = "id") |>
+        st_set_crs(st_crs(lines))
+      out[ok] <- lengths(st_intersects(sl, lines)) > 0
+    }
+    cat(sprintf("  batch %d/%d done\n", i, length(idx)))
+  }
+  as.integer(out)
+}
+
+# Raster version of a crossing, for when there's no fence vector.
+# any    = step line passes through a fence cell (what the old 500 m method did; blends proximity)
+# strict = passes through a fence cell AND neither endpoint is in a fence cell
+#          (removes steps that end on, or walk along, the fence; can miss real crossings that end right past it)
+cross_rast <- function(d, r, batch = 250000) {
+  is_fence <- function(v) !is.na(v) & v > 0
+  any_ <- logical(nrow(d))
+  idx <- split(seq_len(nrow(d)), ceiling(seq_len(nrow(d)) / batch))
+  for (i in seq_along(idx)) {
+    ii <- idx[[i]]
+    ok <- ii[d$sl_[ii] > 0 & !is.na(d$x2_[ii])]
+    if (length(ok)) {
+      df <- tibble(id = rep(seq_along(ok), each = 2),
+                   x  = as.vector(rbind(d$x1_[ok], d$x2_[ok])),
+                   y  = as.vector(rbind(d$y1_[ok], d$y2_[ok])))
+      sl <- sfheaders::sf_linestring(df, x = "x", y = "y", linestring_id = "id") |>
+        st_set_crs(st_crs(crs_steps))
+      e <- terra::extract(r, vect(sl), fun = max, na.rm = TRUE)
+      any_[ok] <- is_fence(e[, 2])
+    }
+    cat(sprintf("  batch %d/%d done\n", i, length(idx)))
+  }
+  start_in <- is_fence(terra::extract(r, cbind(d$x1_, d$y1_))[, 1])
+  end_in   <- is_fence(terra::extract(r, cbind(d$x2_, d$y2_))[, 1])
+  tibble(any = as.integer(any_), strict = as.integer(any_ & !start_in & !end_in))
+}
+
+# Rasterize lines on the 500 m template, then distance (m) to nearest line cell
+dist_raster <- function(lines) {
+  r <- rasterize(vect(lines), tmpl, touches = TRUE)
+  distance(r)
+}
+
+prep_lines <- function(x, bbox_sf) {
+  x |> st_zm() |> st_transform(crs_steps) |>
+    st_filter(bbox_sf) |> select(any_of(c("HYRIV_ID", "UPLAND_SKM", "DIS_AV_CMS")))
+}
+```
+
+## Checkpoint 1: steps load, columns, bad fixes
+
+Load one file at a time (both at once crashed R last time).
+
+```{r check-steps}
+bb_all <- NULL
+for (s in names(STEP_FILES)) {
+  d <- readRDS(STEP_FILES[[s]]) |> standardize_cols()
+  stopifnot(STRATA_COL %in% names(d))
+  cat("\n==", s, "==  rows:", nrow(d), " strata:", n_distinct(d[[STRATA_COL]]), "\n")
+  print(table(d$case_))
+
+  # Bad fixes: used 1-hr steps > 8 km. MET23/MET42 caused West's wet-season artifact.
+  cat("sl_ range (degrees?):", round(range(d$sl_, na.rm = TRUE), 4), "  sl_m median (m):", round(median(d$sl_m[d$case_ == 1], na.rm = TRUE)), "\n")
+  bad <- d |> filter(case_ == 1, sl_m > 8000)
+  cat("Used steps > 8 km:", nrow(bad), "\n")
+  if (nrow(bad) > 0 && "id" %in% names(d)) print(count(bad, id, sort = TRUE))
+  if (any(c("MET23", "MET42") %in% d$id)) warning("MET23/MET42 present in Etosha ", s, ": inspect before fitting")
+
+  bb_s <- st_as_sfc(st_bbox(c(xmin = min(d$x2_, na.rm = TRUE), ymin = min(d$y2_, na.rm = TRUE),
+                              xmax = max(d$x2_, na.rm = TRUE), ymax = max(d$y2_, na.rm = TRUE)),
+                            crs = st_crs(crs_steps)))
+  bb_all <- if (is.null(bb_all)) bb_s else st_union(bb_all, bb_s)
+  rm(d); gc()
+}
+b <- st_bbox(bb_all)
+bb_pop <- st_as_sfc(st_bbox(c(xmin = b[["xmin"]] - 0.2, ymin = b[["ymin"]] - 0.2,
+                               xmax = b[["xmax"]] + 0.2, ymax = b[["ymax"]] + 0.2),
+                             crs = st_crs(crs_steps)))   # ~20 km margin
+```
+
+**Stop here if** there are many > 8 km used steps concentrated in one or two collars. Drop those fixes and regenerate steps before going on.
+
+## Build the feature lines
+
+```{r lines}
+fences    <- if (!is.null(FENCE_VEC)) st_read(FENCE_VEC, quiet = TRUE) |> prep_lines(bb_pop) else NULL
+perennial <- st_read(PERENNIAL,  quiet = TRUE) |> prep_lines(bb_pop)
+
+# Ephemeral rivers: same rule as West and the earlier maps.
+# If read_hr() is loaded, this matches the earlier Etosha check exactly
+# (bb_etosha_hr = the bbox object you passed to read_hr() before).
+if (exists("read_hr") && exists("bb_etosha_hr")) {
+  ephemeral <- read_hr(bb_etosha_hr, min_upland = 1000) |>
+    filter(DIS_AV_CMS < 10) |> prep_lines(bb_pop)
+} else {
+  bb_ll <- st_as_text(st_transform(bb_pop, 4326))
+  ephemeral <- st_read(HR_AFRICA, layer = HR_LAYER, wkt_filter = bb_ll, quiet = TRUE) |>
+    filter(UPLAND_SKM >= 1000, DIS_AV_CMS < 10) |> prep_lines(bb_pop)
+}
+roads <- if (!is.null(ROAD_PATH)) st_read(ROAD_PATH, quiet = TRUE) |> prep_lines(bb_pop) else NULL
+
+fence_cells_pop <- global(crop(fence_r, vect(bb_pop)) > 0, "sum", na.rm = TRUE)[1, 1]
+cat("Fence cells in Etosha extent:", fence_cells_pop, " fence vector:", if (is.null(fences)) "none (raster crossings)" else nrow(fences),
+    " perennial:", nrow(perennial), " ephemeral:", nrow(ephemeral),
+    " roads:", if (is.null(roads)) "raster kept" else nrow(roads), "\n")
+stopifnot(fence_cells_pop > 0, nrow(ephemeral) > 0)
+
+st_write(ephemeral, here("data", "Linear_features", "etosha_ephemeral_rivers_hydrorivers_1k.gpkg"),
+         delete_dsn = TRUE, quiet = TRUE)
+```
+
+## Checkpoint 2: map before extracting
+
+Check what the filter picks up around Etosha: the Ekuma, Omuramba Ovambo and other drainage lines into the pan are expected. Also look at the perennial (blue) layer: earlier maps showed two questionable Etosha river segments.
+
+```{r map, fig.width = 10, fig.height = 7}
+fence_pts <- crop(fence_r, vect(bb_pop)) |> as.points() |> st_as_sf()
+names(fence_pts)[1] <- "v"
+fence_pts <- filter(fence_pts, v > 0)
+
+ggplot() +
+  geom_sf(data = ephemeral, colour = "goldenrod", linewidth = 0.3) +
+  geom_sf(data = perennial, colour = "steelblue", linewidth = 0.6) +
+  geom_sf(data = fence_pts, colour = "red", size = 0.2) +
+  coord_sf(crs = crs_steps) + theme_minimal() +
+  labs(title = "Etosha: new fences (red), perennial rivers (blue), ephemeral rivers (gold)")
+ggsave(here("outputs", "figures", "etosha_v2_linear_features.png"), width = 10, height = 7, dpi = 200)
+
+
+ephemeral <- st_read(HR_AFRICA, layer = HR_LAYER, wkt_filter = st_as_text(bb_pop), quiet = TRUE) |>
+  filter(UPLAND_SKM >= 1000, DIS_AV_CMS < 10) |> prep_lines(bb_pop)
+cuvelai <- st_read(PERENNIAL, quiet = TRUE) |> prep_lines(bb_pop)
+
+# same geometry type and column name, so rbind() lines them up
+std <- function(x) { x <- st_cast(x, "MULTILINESTRING"); st_geometry(x) <- "geometry"; x }
+ephemeral <- rbind(std(ephemeral), std(cuvelai))
+perennial <- cuvelai[0, ]
+
+stopifnot(!any(st_is_empty(ephemeral)))   # no empty lines this time
+nrow(ephemeral)                           # 399
+st_write(ephemeral, here("data", "Linear_features", "etosha_ephemeral_rivers_hydrorivers_1k.gpkg"),
+         delete_dsn = TRUE, quiet = TRUE)
+
+ggplot(ephemeral) + geom_sf(colour = "goldenrod") + theme_minimal()   # Cuvelai channels should now be gold
+```
+
+## Distance rasters and extraction
+
+```{r dist-rasters}
+# fence_dist_r comes straight from Marissa's dist_vetfences_500m.tif (loaded in `paths`)
+eph_dist_r   <- dist_raster(ephemeral)
+writeRaster(eph_dist_r,  here("data", "Linear_features", "etosha_ephemeral_rivers_dist_1k_500m.tif"), overwrite = TRUE)
+```
+
+```{r extract}
+for (s in names(STEP_FILES)) {
+  cat("\n==", s, "==\n")
+  d <- readRDS(STEP_FILES[[s]]) |> standardize_cols()
+  bad_strata <- d[[STRATA_COL]][d$case_ == 1 & d$sl_m > 8000]
+  d <- d[!d[[STRATA_COL]] %in% bad_strata, ]
+  cat("Dropped", length(bad_strata), "strata with used steps > 8 km\n")
+  xy <- cbind(d$x2_, d$y2_)
+
+  # keep the old raster-based values for comparison
+  d <- d |> rename(any_of(c(fence_dist_old = "fence_dist", fence_cross_r500 = "fence_cross",
+                            river_cross_r500 = "river_cross")))
+
+  # endpoint distances (km, so coefficients are readable; match however your other dist terms are scaled)
+  d$fence_dist             <- terra::extract(fence_dist_r, xy)[, 1] / 1000
+  d$ephemeral_rivers_dist  <- terra::extract(eph_dist_r,  xy)[, 1] / 1000
+  d$ephemeral_rivers_prox  <- exp(-d$ephemeral_rivers_dist)   # = exp(-d_m / 1000), same as West
+
+  # vector crossings
+  cat("fences\n")
+  if (!is.null(fences)) {
+    d$fence_cross <- cross_vec(d, fences)
+  } else {
+    fc <- cross_rast(d, fence_r)
+    d$fence_cross_any <- fc$any
+    d$fence_cross     <- fc$strict   # model uses strict; compare counts with _any and _r500 at checkpoint 3
+  }
+  cat("perennial\n"); d$river_cross     <- cross_vec(d, perennial)
+  cat("ephemeral\n"); d$ephemeral_cross <- cross_vec(d, ephemeral)
+  if (!is.null(roads)) {
+    d <- d |> rename(any_of(c(road_cross_r500 = "road_cross")))
+    cat("roads\n"); d$road_cross <- cross_vec(d, roads)
+  }
+
+  stopifnot(!anyNA(d$fence_dist), !anyNA(d$ephemeral_rivers_dist))
+  saveRDS(d, here("outputs", sprintf("ele_trk_extract_etosha_%s_v2.rds", s)))
+  rm(d); gc()
+}
+```
+
+## Checkpoint 3: crossing counts and collinearity
+
+```{r check-cross}
+cross_summary <- map_dfr(names(STEP_FILES), function(s) {
+  d <- readRDS(here("outputs", sprintf("ele_trk_extract_etosha_%s_v2.rds", s)))
+  out <- d |>
+    select(case_, any_of(c("fence_cross", "fence_cross_any", "fence_cross_r500","river_cross", "river_cross_r500",
+                           "ephemeral_cross", "road_cross"))) |>
+    pivot_longer(-case_, names_to = "term", values_to = "x") |>
+    group_by(term, case_) |> summarise(n_cross = sum(x, na.rm = TRUE), rate = mean(x, na.rm = TRUE), .groups = "drop") |>
+    pivot_wider(names_from = case_, values_from = c(n_cross, rate), names_glue = "{.value}_{ifelse(case_ == 1, 'used', 'random')}") |>
+    mutate(season = s, ratio_used_random = rate_used / rate_random)
+  rm(d); gc(); out
+})
+cross_summary |> arrange(term, season) |> print(n = Inf)
+```
+
+How to read it: `ratio_used_random` near 1 means no barrier, well below 1 means a barrier. Vector counts should be **lower** than the `_r500` versions (the raster counted near-misses). Any term with fewer than `MIN_USED_CROSS` used crossings in a season gets dropped from that season's model below.
+
+```{r check-cor}
+d <- readRDS(here("outputs", "ele_trk_extract_etosha_dry_v2.rds")) |> slice_sample(n = 200000)
+cand <- intersect(c("ephemeral_rivers_dist", "ephemeral_rivers_prox", "ephemeral_cross", "water_rivers_dist",
+                    "river_cross", "road_cross", "road_dist", "fence_dist", "fence_cross"), names(d))
+cm <- cor(d[, cand], use = "pairwise.complete.obs")
+print(round(cm, 2))
+flag <- which(abs(cm) > 0.6 & upper.tri(cm), arr.ind = TRUE)
+if (nrow(flag)) { cat("\n|r| > 0.6:\n"); print(tibble(a = rownames(cm)[flag[, 1]], b = colnames(cm)[flag[, 2]], r = cm[flag])) }
+rm(d); gc()
+```
+
+(`ephemeral_rivers_dist` and `_prox` will correlate with each other. That's fine, since they're never in the same model.)
+
+## Fit models
+
+**Match `hab_terms` to the Etosha main model in `linear_features_ssf_etosha.Rmd`** (Etosha base drops `core_dist`, keeps `elevation` and `water_rivers_dist`). The list below is the KAZA one: edit it.
+
+```{r fit}
+hab_terms  <- c("elevation", "slope", "aspect", "evi", "world_pop", "tree_cover", "shrubland",
+                "grassland", "water_rivers_dist", "cropland_dist", "urban_dist")
+dist_terms <- c("road_dist", "fence_dist")
+
+fit_one <- function(terms, d) {
+  f <- reformulate(c(terms, sprintf("strata(%s)", STRATA_COL)), response = "case_")
+  clogit(f, data = d, model = FALSE)
+}
+
+tidy_ci <- function(m) {
+  s <- summary(m)$coefficients; ci <- confint(m)
+  tibble(term = rownames(s), coef = s[, "coef"], se = s[, "se(coef)"],
+         exp_coef = exp(s[, "coef"]), lo95 = exp(ci[, 1]), hi95 = exp(ci[, 2]), p = s[, "Pr(>|z|)"])
+}
+
+results <- list()
+for (s in names(STEP_FILES)) {
+  cat("\n== fitting", s, "==\n")
+  d <- readRDS(here("outputs", sprintf("ele_trk_extract_etosha_%s_v2.rds", s)))
+
+  # which crossing terms have enough data this season
+  cs <- cross_summary |> filter(season == s)
+  enough <- function(t) isTRUE(cs$n_cross_used[cs$term == t] >= MIN_USED_CROSS)
+  cross_terms <- c("road_cross", "river_cross", if (enough("fence_cross")) "fence_cross")
+  cat("Crossing terms used:", paste(cross_terms, collapse = ", "), "\n")
+  if (!enough("ephemeral_cross")) warning("Too few ephemeral crossings in ", s)
+
+  base <- c(hab_terms, dist_terms, cross_terms)
+  specs <- list(
+    `1. base (new fences, vector crossings)` = base,
+    `2. + eph dist`                          = c(base, "ephemeral_rivers_dist"),
+    `3. + eph prox`                          = c(base, "ephemeral_rivers_prox"),
+    `4. + eph dist + eph cross`              = c(base, "ephemeral_rivers_dist", "ephemeral_cross"),
+    `5. + eph prox + eph cross`              = c(base, "ephemeral_rivers_prox", "ephemeral_cross")
+  )
+  fits <- map(specs, fit_one, d = d)
+
+  aic_tab <- tibble(season = s, model = names(fits),
+                    AIC = map_dbl(fits, AIC), BIC = map_dbl(fits, BIC)) |>
+    mutate(dAIC = AIC - min(AIC), dBIC = BIC - min(BIC))
+
+  # step-length check on the best ephemeral model
+  best_eph <- aic_tab |> filter(model != names(specs)[1]) |> slice_min(AIC) |> pull(model)
+  m_sl  <- fit_one(c(specs[[best_eph]], "sl_m", "log_sl_m"), d)
+  shift <- tidy_ci(fits[[best_eph]]) |> select(term, coef, se) |>
+    inner_join(tidy_ci(m_sl) |> select(term, coef_sl = coef), by = "term") |>
+    mutate(season = s, shift_move_se = (coef_sl - coef) / se)
+
+  results[[s]] <- list(aic = aic_tab,
+                       coefs = imap_dfr(fits, ~ tidy_ci(.x) |> mutate(model = .y, season = s)),
+                       shift = shift, best_eph = best_eph)
+  rm(d, fits, m_sl); gc()
+}
+saveRDS(results, here("outputs", "etosha_ssf_v2_results.rds"))
+```
+
+## Results
+
+```{r results}
+aic_all <- map_dfr(results, "aic"); print(aic_all)
+
+# the terms the team asked about
+map_dfr(results, "coefs") |>
+  filter(str_detect(term, "ephemeral|fence|river_cross|road_cross")) |>
+  arrange(season, model, term) |> print(n = Inf)
+
+# step-length robustness: |shift| < 2 SE = robust
+map_dfr(results, "shift") |> filter(str_detect(term, "cross|ephemeral")) |> print(n = Inf)
+
+# do the habitat coefficients move when ephemeral terms are added? (base vs best)
+map_dfr(names(results), function(s) {
+  cf <- results[[s]]$coefs
+  inner_join(cf |> filter(model == "1. base (new fences, vector crossings)") |> select(term, coef, se),
+             cf |> filter(model == results[[s]]$best_eph) |> select(term, coef_eph = coef), by = "term") |>
+    mutate(season = s, shift_se = (coef_eph - coef) / se)
+}) |> filter(term %in% hab_terms) |> arrange(desc(abs(shift_se))) |> print()
+```

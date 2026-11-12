@@ -556,6 +556,8 @@ print(ext(rast(hydro_file)))      # hydrorivers' own extent, in its own CRS
 ```
 
 ```{r}
+#Rasterizing linear features 
+
 library(terra)
 
 # Allow GDAL to rebuild missing/corrupted .shx index files automatically
@@ -751,4 +753,120 @@ message("Done. Land cover rasters written to: ", out_dir)
  freq(rast(file.path(out_dir, "lc_grassland_2010.tif")))
 ```
 
+```{r}
+#=====================================
+#Raster and distance to for ALL Vet Fences 
+#=====================================
+library(terra)
+
+terraOptions(memfrac = 0.9, progress = 1)
+
+# Rebuild missing/corrupted .shx index automatically
+Sys.setenv(SHAPE_RESTORE_SHX = "YES")
+
+# -----------------------------
+# 1. USER CONFIGURATION
+# -----------------------------
+fence_file <- path.expand("~/Desktop/Arnhold/sparcle-hwc-old2/code/sparcle-hwc/data/Linear_features/all_vet_fences/vetfences_all.shp")
+
+# Existing 500 m EPSG:4326 raster your other SSF covariates use
+template_file <- path.expand("~/Desktop/Arnhold/sparcle-hwc-old2/code/sparcle-hwc/data/500m_data/terrain_rast_500m.tif")
+
+out_dir <- path.expand("~/Desktop/Arnhold/sparcle-hwc-old2/code/sparcle-hwc/data/Linear_features")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+common_ext  <- ext(12.5, 25.5, -21.5, -16.5)   # xmin, xmax, ymin, ymax
+common_crs  <- "EPSG:4326"
+metric_crs  <- "EPSG:32734"                    # flat-plane CRS for distance math (matches your water script)
+res_m       <- 500
+
+out_binary <- file.path(out_dir, "vetfences_all_500m.tif")
+out_dist   <- file.path(out_dir, "dist_vetfences_500m.tif")
+
+# -----------------------------
+# 2. TEMPLATE + FENCE LINES
+# -----------------------------
+target_template <- rast(template_file)
+if (!same.crs(target_template, common_crs)) {
+  warning("Template CRS is not EPSG:4326 -- reprojecting template.")
+  target_template <- project(target_template, common_crs)
+}
+
+fences <- vect(fence_file)
+if (!same.crs(fences, common_crs)) {
+  fences <- project(fences, common_crs)
+}
+
+# Keep only fences that touch the study area
+fences <- crop(fences, common_ext)
+
+# -----------------------------
+# 3. BINARY FENCE RASTER (1 = fence, 0 = no fence)
+#    Rasterized straight onto the 4326 template so it aligns exactly
+#    with your other covariates.
+#    touches = TRUE -> every cell the line passes through becomes 1
+# -----------------------------
+fence_bin <- rasterize(fences, target_template,
+                       field = 1, background = 0,
+                       touches = TRUE, fun = "max")
+names(fence_bin) <- "vetfences"
+
+writeRaster(fence_bin, out_binary, datatype = "INT1U", overwrite = TRUE)
+message("Wrote binary fence raster -> ", out_binary)
+
+# -----------------------------
+# 4. DISTANCE-TO-FENCE RASTER (meters)
+#    Distance is computed in a metric CRS, then projected onto the
+#    500 m EPSG:4326 template.
+# -----------------------------
+fences_metric <- project(fences, metric_crs)
+
+# Metric grid covering the study area at 500 m
+ext_metric <- ext(project(as.polygons(common_ext, crs = common_crs), metric_crs))
+r_metric   <- rast(ext_metric, resolution = res_m, crs = metric_crs)
+
+# 1 where fence, NA elsewhere (distance() measures to nearest non-NA cell)
+fence_metric <- rasterize(fences_metric, r_metric,
+                          field = 1, background = NA,
+                          touches = TRUE, fun = "max")
+fence_metric <- toMemory(fence_metric)
+
+dist_metric <- distance(fence_metric)
+
+dist_fence <- project(dist_metric, target_template, method = "bilinear")
+names(dist_fence) <- "dist_vetfences"
+
+writeRaster(dist_fence, out_dist, overwrite = TRUE)
+message("Wrote distance-to-fence raster -> ", out_dist)
+
+# -----------------------------
+# 5. QUICK CHECKS
+# -----------------------------
+stopifnot(compareGeom(fence_bin, target_template, stopOnError = FALSE),
+          compareGeom(dist_fence, target_template, stopOnError = FALSE))
+
+print(freq(fence_bin))   # counts of 0 vs 1
+print(global(dist_fence, c("min", "max", "mean"), na.rm = TRUE))
+
+par(mfrow = c(1, 2))
+plot(fence_bin, main = "Fence (binary)")
+plot(dist_fence, main = "Distance to fence (m)")
+par(mfrow = c(1, 1))
+
+```
+
+```{r}
+#==============================
+#Distance to ephemeral rivers 
+#==============================
+
+#West 
+west_ephemeral_dist <- rast("~/Desktop/Arnhold/sparcle-hwc-old2/code/sparcle-hwc/data/Linear_features/west_ephemeral_rivers_dist_1k_500m.tif")
+print(west_ephemeral_dist)
+plot(west_ephemeral_dist)
+
+west_ephemeral_prox <- rast("~/Desktop/Arnhold/sparcle-hwc-old2/code/sparcle-hwc/data/Linear_features/west_ephemeral_rivers_prox_1k_500m.tif")
+print(west_ephemeral_prox)
+plot(west_ephemeral_prox)
+```
 
