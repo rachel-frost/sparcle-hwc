@@ -40,7 +40,7 @@ filter <- dplyr::filter
 
 #Regenerating needs `extract_lc_mixed()` from
 #`code/etosha_ssf.Rmd` and `library(amt)`
-for (s in c("wet", "dry")) {
+for (s in c("wet_v2", "dry_v2")) {
   out <- here("outputs", paste0("ele_trk_extract_kaza_", s, "_lcmixed.rds"))
   if (file.exists(out)) { cat(s, "already done\n"); next }
 
@@ -61,8 +61,8 @@ for (s in c("wet", "dry")) {
 
 ```{r paths}
 STEP_FILES <- c(
-  wet = here("outputs", "ele_trk_extract_kaza_wet_lcmixed.rds"),
-  dry = here("outputs", "ele_trk_extract_kaza_dry_lcmixed.rds")
+  wet = here("outputs", "ele_trk_extract_kaza_wet_v2_lcmixed.rds"),
+  dry = here("outputs", "ele_trk_extract_kaza_dry_v2_lcmixed.rds")
 )
 
 FENCE_RAST   <- here("data", "Linear_features", "all_vet_fences", "vetfences_all_500m.tif")
@@ -334,6 +334,7 @@ rm(d); gc()
 
 Kaza habitat terms 
 
+
 ## Fit models
 
 **Match `hab_terms` to the KAZA main model in
@@ -342,8 +343,16 @@ output.
 
 ```{r fit}
 hab_terms  <- c("elevation", "slope", "aspect", "evi", "world_pop", "tree_cover", "shrubland",
-                "grassland", "water_rivers_dist", "cropland_dist", "urban_dist")
+                "cropland", "water", "other_lc", "water_rivers_dist", "cropland_dist", "urban_dist")
 dist_terms <- c("road_dist", "fence_dist")
+
+add_lc_classes <- function(d) {
+  d |> mutate(across(c(tree_cover, shrubland, grassland), ~ replace_na(.x, 0)),
+              water    = as.integer(water_rivers_dist == 0),
+              cropland = as.integer(cropland_dist == 0 & water == 0),
+              across(c(tree_cover, shrubland, grassland), ~ if_else(water == 1, 0L, as.integer(.x))),
+              other_lc = as.integer(tree_cover + shrubland + grassland + cropland + water == 0))
+}
 
 fit_one <- function(terms, d) {
   f <- reformulate(c(terms, sprintf("strata(%s)", STRATA_COL)), response = "case_")
@@ -359,7 +368,10 @@ tidy_ci <- function(m) {
 results <- list()
 for (s in names(STEP_FILES)) {
   cat("\n== fitting", s, "==\n")
-  d <- readRDS(here("outputs", sprintf("ele_trk_extract_kaza_%s_v2.rds", s)))
+  d <- readRDS(here("outputs", sprintf("ele_trk_extract_kaza_%s_v2.rds", s))) |>
+    add_lc_classes() 
+  
+  print(table(n_classes = rowSums(d[, c("tree_cover", "shrubland", "grassland", "cropland", "water", "other_lc")])))
 
   # which crossing terms have enough data this season
   cs <- cross_summary |> filter(season == s)
@@ -421,7 +433,8 @@ map_dfr(names(results), function(s) {
 
 ```{r}
   for (s in names(STEP_FILES)) {
-    d <- readRDS(here("outputs", sprintf("ele_trk_extract_kaza_%s_v2.rds", s)))
+    d <- readRDS(here("outputs", sprintf("ele_trk_extract_kaza_%s_v2.rds", s))) |>
+      add_lc_classes() 
     terms <- c(hab_terms, dist_terms, "road_cross", "river_cross", "fence_cross",
                "ephemeral_rivers_prox", "ephemeral_cross")
     m <- fit_one(terms, d)
