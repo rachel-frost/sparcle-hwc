@@ -1,0 +1,350 @@
+---
+title: "nonstatic_variables"
+output: html_document
+date: "2026-10-18"
+---
+# ------------------------------------------------------------
+# Assesing change in EVI from 2010-2020
+# ------------------------------------------------------------
+```{r}
+library(here)
+library(tidyverse)
+library(terra)
+
+kaza_valid_area <- vect(here("outputs", "kaza_valid_area.gpkg"))
+etosha_vect <- vect(etosha_pts, geom = c("x2_", "y2_"), crs = "EPSG:4326")
+etosha_valid_area <- buffer(convHull(etosha_vect), width = 50000)
+
+```
+
+```{r}
+# ------------------------------------------------------------
+# Variation in EVI
+# ------------------------------------------------------------
+
+# load libraries
+library(here)
+library(tidyverse)
+library(terra)
+# ------------------
+
+# load data
+evi_folder <- here("data", "500m_data", "EVI data")
+
+build_evi_season <- function(season) {
+  if (season == "dry") {
+    years <- 2008:2020
+    paths <- file.path(evi_folder, paste0("evi_dry_", years, ".tif"))
+  } else {
+    years <- 2008:2021   # labelled by end year, as in resistance_surface.Rmd
+    paths <- file.path(evi_folder, paste0("evi_wet_", years - 1, "_", years, ".tif"))
+  }
+  r <- rast(paths) / 10000   # rescale to true EVI
+  names(r) <- years
+  time(r)  <- years
+  r
+}
+
+evi <- map(c("dry", "wet"), build_evi_season) |> set_names(c("dry", "wet"))
+evi$dry   # check nlyr, extent, CRS, min/max (should now be ~0-0.4)
+# -------------------
+
+# change over time (per season)
+evi_change <- map(evi, \(r) r[[nlyr(r)]] - r[[1]])          # last year - first year
+evi_mean   <- map(evi, \(r) app(r, mean, na.rm = TRUE))      # average per pixel
+evi_trend  <- map(evi, \(r) regress(r, time(r))[[2]])        # slope = EVI change per year
+# -------------------
+
+# plotting change
+plot(rast(evi_change), main = c("Dry: last - first", "Wet: last - first"),
+     col = hcl.colors(50, "RdYlGn"))   # red = decline, green = gain
+plot(rast(evi_mean),   main = c("Dry: mean EVI", "Wet: mean EVI"))
+plot(rast(evi_trend),  main = c("Dry: trend per year", "Wet: trend per year"),
+     col = hcl.colors(50, "RdYlGn"))
+# -------------------
+
+# plotting time series
+evi_ts <- map_dfr(evi, \(r) global(r, mean, na.rm = TRUE) |>
+                    mutate(year = time(r)), .id = "season")
+
+# overall min and max EVI across all pixels, years, and seasons
+evi_range <- map(evi, \(r) minmax(r, compute = TRUE)) |>
+  unlist() |> range(na.rm = TRUE)
+evi_range
+
+# plot of mean EVI per year split by wet and dry seasons
+evi_change_plot <- ggplot(evi_ts, aes(year, mean, colour = season)) +
+  geom_line() + geom_point() +
+  scale_y_continuous(limits = evi_range) +
+  labs(y = "Mean EVI", x = "Year")
+evi_change_plot
+
+# plot of mean EVI per year split by wet and dry seasons and 1 SD
+evi_ts_sd <- map_dfr(evi, \(r) {
+  data.frame(year = time(r),
+             mean = global(r, mean, na.rm = TRUE)$mean,
+             sd   = global(r, sd,   na.rm = TRUE)$sd)
+}, .id = "season")
+
+evi_change_plot_sd <- ggplot(evi_ts_sd, aes(year, mean, fill = season, colour = season)) +
+  geom_ribbon(aes(ymin = mean - sd, ymax = mean + sd), alpha = 0.2, colour = NA) +
+  geom_line() +
+  scale_y_continuous(limits = c(0, NA)) +
+  labs(y = "Mean EVI (± 1 SD across pixels)", x = "Year")
+evi_change_plot_sd
+
+# summarize how much a multi-year stack changes over time with pearson's r
+summarise_change <- function(r) {
+  cors <- layerCor(r, "pearson", na.rm = TRUE)
+  cors <- if (is.list(cors)) cors$correlation else cors
+  cors <- cors[upper.tri(cors)]
+
+  temporal_sd <- global(app(r, sd, na.rm = TRUE), mean, na.rm = TRUE)[[1]]  # avg per-pixel SD over time
+  spatial_sd  <- mean(global(r, sd, na.rm = TRUE)$sd)                       # avg SD across pixels per year
+
+  yr_means <- global(r, mean, na.rm = TRUE)$mean
+
+  tibble(
+    min_cor_between_years = min(cors),
+    mean_cor_between_years = mean(cors),
+    temporal_to_spatial_sd = temporal_sd / spatial_sd,
+    pct_change_in_mean = (last(yr_means) - first(yr_means)) / first(yr_means) * 100
+  )
+}
+# run on both seasons
+change_tbl <- map_dfr(evi, summarise_change, .id = "variable") |>
+  mutate(variable = paste0("evi_", variable))
+change_tbl
+
+# crop to etosha
+evi_etosha <- map(evi, \(r) r |> crop(etosha_valid_area) |> mask(etosha_valid_area))
+evi_kaza <- map(evi, \(r) r |> crop(kaza_valid_area) |> mask(kaza_valid_area))
+```
+
+# ------------------------------------------------------------
+# Assessing land cover chnage from 2008-2020
+# ------------------------------------------------------------
+
+```{r}
+# ------------------------------------------------------------
+# Variation in land cover
+# ------------------------------------------------------------
+
+# load libraries
+library(here)
+library(tidyverse)
+library(terra)
+# ------------------
+
+# set up (same classes as resistance_surface.Rmd)
+lc_dist_folder <- here("data", "ESACCI_LCCS", "lc_dist_2")
+lc_types <- c("cropland", "grassland", "shrubland", "tree_cover", "urban", "water_rivers")
+years    <- 2008:2020   # years produced by ESA_landcover.Rmd
+# ------------------
+
+# load data: one SpatRaster per class, one layer per year
+build_lc_dist_class <- function(lc_type) {
+  paths <- file.path(lc_dist_folder, paste0("dist_", lc_type, "_", years, ".tif"))
+  missing <- years[!file.exists(paths)]
+  if (length(missing) > 0) {
+    warning("Missing ", lc_type, " for: ", paste(missing, collapse = ", "))
+  }
+  r <- rast(paths[file.exists(paths)])
+  names(r) <- years[file.exists(paths)]
+  time(r)  <- years[file.exists(paths)]
+  r
+}
+
+lc_dist <- map(lc_types, build_lc_dist_class) |> set_names(lc_types)
+lc_dist$cropland   # 13 layers named 2008 ... 2020
+# ------------------
+
+# land cover change analysis
+lc_trend  <- map(lc_dist, \(r) regress(r, time(r))[[2]])   # metres per year
+lc_change <- map(lc_dist, \(r) r[["2020"]] - r[["2008"]])
+
+lc_ts <- map_dfr(lc_dist, \(r) global(r, mean, na.rm = TRUE) |>
+                   mutate(year = time(r)), .id = "class")
+# ------------------
+
+# plotting mean distance per year
+lc_change_plot <- ggplot(lc_ts, aes(year, mean / 1000, colour = class)) +
+  geom_line() + geom_point() +
+  scale_y_continuous(limits = c(0, NA)) +
+  labs(y = "Mean distance to class (km)", x = "Year")
+lc_change_plot
+
+lc_change_by_type_plot <- ggplot(lc_ts, aes(year, mean / 1000)) +
+  geom_line() + geom_point() +
+  facet_wrap(~ class, scales = "free_y") +
+  scale_y_continuous(limits = c(0, NA)) +
+  labs(y = "Mean distance to class (km)", x = "Year")
+lc_change_by_type_plot
+# ------------------
+
+# summarise how much each class changes over time
+source(here("code", "summarise_change.R"))   # or paste the function here
+
+lc_change_tbl <- map_dfr(lc_dist, summarise_change, .id = "variable") |>
+  mutate(variable = paste0("dist_", variable))
+lc_change_tbl
+
+# convert to km for readability
+lc_dist_km <- map(lc_dist, \(r) r / 1000)
+# ------------------
+
+# change over time (per class)
+lc_change <- map(lc_dist_km, \(r) r[[nlyr(r)]] - r[[1]])         # last year - first year (km)
+lc_mean   <- map(lc_dist_km, \(r) app(r, mean, na.rm = TRUE))     # average distance per pixel
+lc_trend  <- map(lc_dist_km, \(r) regress(r, time(r))[[2]])       # slope = km per year
+lc_sd_time <- map(lc_dist_km, \(r) app(r, sd, na.rm = TRUE))      # year-to-year variability per pixel
+# ------------------
+
+# plotting change maps
+# negative = class got closer (often expansion), positive = class got farther away
+plot(rast(lc_change), main = paste0(lc_types, ": last - first (km)"),
+     col = hcl.colors(50, "RdBu"))
+plot(rast(lc_mean),   main = paste0(lc_types, ": mean distance (km)"))
+plot(rast(lc_trend),  main = paste0(lc_types, ": trend (km/yr)"),
+     col = hcl.colors(50, "RdBu"))
+plot(rast(lc_sd_time), main = paste0(lc_types, ": SD across years (km)"))
+# ------------------
+
+# plotting time series
+lc_ts_sd <- map_dfr(lc_dist_km, \(r) {
+  data.frame(year = time(r),
+             mean = global(r, mean, na.rm = TRUE)$mean,
+             sd   = global(r, sd,   na.rm = TRUE)$sd)
+}, .id = "class")
+
+# min and max distance per class, across all pixels and years
+lc_range <- map_dfr(lc_dist_km, \(r) {
+  mm <- minmax(r, compute = TRUE)
+  tibble(min = min(mm[1, ]), max = max(mm[2, ]))
+}, .id = "class")
+lc_range
+
+# mean distance per year, on each class's full min-max range
+lc_change_plot <- ggplot(lc_ts_sd, aes(year, mean)) +
+  geom_line() + geom_point() +
+  geom_blank(data = lc_range, aes(x = 2008, y = min), inherit.aes = FALSE) +  # force axis to min
+  geom_blank(data = lc_range, aes(x = 2008, y = max), inherit.aes = FALSE) +  # ...and max
+  facet_wrap(~ class, scales = "free_y") +
+  labs(y = "Mean distance to class (km)", x = "Year")
+lc_change_plot
+
+# mean distance per year with ± 1 SD across pixels
+lc_change_plot_sd <- ggplot(lc_ts_sd, aes(year, mean)) +
+  geom_ribbon(aes(ymin = pmax(mean - sd, 0), ymax = mean + sd), alpha = 0.2) +
+  geom_line() +
+  facet_wrap(~ class, scales = "free_y") +
+  labs(y = "Mean distance (km, ± 1 SD across pixels)", x = "Year")
+lc_change_plot_sd
+# ------------------
+
+# summarise how much each class changes over time
+lc_change_tbl <- map_dfr(lc_dist_km, summarise_change, .id = "variable") |>
+  mutate(variable = paste0("dist_", variable))
+lc_change_tbl
+
+# convert to km for readability
+lc_dist_km <- map(lc_dist, \(r) r / 1000)
+
+get_cor <- function(r) {
+  cors <- layerCor(r, "pearson", na.rm = TRUE)
+  if (is.list(cors)) cors$correlation else cors
+}
+
+lc_cors <- map(lc_dist_km, get_cor)
+
+lc_cor_2008 <- map_dfr(lc_cors, \(m) tibble(year = years, r = m[1, ]), .id = "class")
+
+ggplot(lc_cor_2008, aes(year, r)) +
+  geom_line() + geom_point() +
+  facet_wrap(~ class) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(y = "Pearson's r with 2008", x = "Year")
+
+lc_cors <- map(lc_dist_km, get_cor)
+
+# land cover script, same as EVI's change_tbl
+lc_change_tbl <- map_dfr(lc_dist_km, summarise_change, .id = "variable") |>
+  mutate(variable = paste0("dist_", variable))
+lc_change_tbl
+```
+
+# ------------------------------------------------------------
+# Assessing population change from 2008-2020
+# ------------------------------------------------------------
+
+```{r}
+# ------------------------------------------------------------
+# Variation in population
+# ------------------------------------------------------------
+
+# load libraries
+library(here)
+library(tidyverse)
+library(terra)
+# ------------------
+
+# load data
+gee_folder <- here("data", "500m_data")
+years      <- 2008:2020   # match EVI and land cover
+
+pop <- rast(file.path(gee_folder, "worldPop_comb_img_500m.tif"))[[as.character(years)]]
+time(pop) <- years
+pop   # check nlyr = 13, names 2008 ... 2020, min/max
+# -------------------
+
+# change over time
+pop_change  <- pop[[nlyr(pop)]] - pop[[1]]            # last year - first year
+pop_mean    <- app(pop, mean, na.rm = TRUE)            # average per pixel
+pop_trend   <- regress(pop, time(pop))[[2]]            # slope = people per pixel per year
+pop_sd_time <- app(pop, sd, na.rm = TRUE)              # year-to-year variability per pixel
+# -------------------
+
+# plotting change
+plot(pop_change, main = "Population: last - first",
+     col = hcl.colors(50, "RdBu", rev = TRUE))         # red = increase, blue = decrease
+plot(log10(pop_mean + 1), main = "Mean population (log10 + 1)")
+plot(pop_trend, main = "Population trend (per year)",
+     col = hcl.colors(50, "RdBu", rev = TRUE))
+plot(pop_sd_time, main = "Population: SD across years")
+# -------------------
+
+# plotting time series
+pop_range <- range(minmax(pop, compute = TRUE))
+pop_range
+
+pop_ts_sd <- data.frame(year = time(pop),
+                        mean = global(pop, mean, na.rm = TRUE)$mean,
+                        sd   = global(pop, sd,   na.rm = TRUE)$sd)
+
+# mean population per year
+pop_change_plot <- ggplot(pop_ts_sd, aes(year, mean)) +
+  geom_line() + geom_point() +
+  scale_y_continuous(limits = c(0, NA)) +
+  labs(y = "Mean population per pixel", x = "Year")
+pop_change_plot
+
+# mean population per year with ± 1 SD across pixels
+pop_change_plot_sd <- ggplot(pop_ts_sd, aes(year, mean)) +
+  geom_ribbon(aes(ymin = pmax(mean - sd, 0), ymax = mean + sd), alpha = 0.2) +
+  geom_line() +
+  labs(y = "Mean population per pixel (± 1 SD across pixels)", x = "Year")
+pop_change_plot_sd
+# -------------------
+
+# summarise how much population changes over time
+source(here("code", "summarise_change.R"))   # or paste the function here
+
+pop_change_tbl <- summarise_change(pop) |>
+  mutate(variable = "world_pop", .before = 1)
+pop_change_tbl
+```
+```{r}
+
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.

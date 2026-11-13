@@ -951,4 +951,29 @@ plot(res_west_dry$mean_lp,           main = "West Dry Resistance (mean LP)")
 plet(res_west_wet$mean_lp, col = rev(terrain.colors(100)), tiles = "OpenStreetMap")
 ```
 ```
+```{r}
+#12. GPS each year's resistance surface
+# ------------------------------------------------------------
+used_steps <- ele_trk_extract_etosha |>
+  as.data.frame() |>
+  filter(case_) |>                                   # used steps only
+  mutate(hydro_year = if_else(month(t1_) >= 11, year(t1_) + 1L, year(t1_))) |>  # same as the SSF scripts
+  select(x2_, y2_, season, hydro_year) |>
+  drop_na()
+
+plot_res_with_steps <- function(res_by_year, season_name) {
+  par(mfrow = c(1, nlyr(res_by_year)))
+  for (yr in names(res_by_year)) {
+    pts <- filter(used_steps, season == season_name, hydro_year == as.integer(yr))
+    plot(res_by_year[[yr]], ext = ext(valid_area_etosha),
+         main = paste0("Etosha ", season_name, " ", yr, " (n = ", nrow(pts), " steps)"))
+    points(pts$x2_, pts$y2_, pch = 16, cex = 0.1,
+           col = adjustcolor("red", alpha.f = 0.05))
+  }
+  par(mfrow = c(1, 1))
+}
+
+plot_res_with_steps(res_etosha_wet$by_year, "wet")   # 2010, 2011, 2012
+plot_res_with_steps(res_etosha_dry$by_year, "dry")   # 2009, 2010, 2011
+```
 
