@@ -527,6 +527,11 @@ list.files(here(), pattern = "ssf_v2_final", recursive = TRUE, full.names = TRUE
 list.files("~/Desktop/Arnhold", pattern = "ssf_v2_final", recursive = TRUE, full.names = TRUE)
 ```
 
+```{r}
+par(mfrow = c(4, 5), mar = c(2, 2, 1, 1)) 
+plot(uhc_results$west_dry)
+# plot(conf_envelope(as.data.frame(uhc_results$etosha_wet), levels = c(0.95, 1)))
+```
 
 
 
