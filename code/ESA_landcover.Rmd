@@ -1,5 +1,5 @@
 ---
-title: "ESA_CCI_Land_cover"
+title: "Land cover and Distance to Covariate rasters"
 author: "Marissa Brenner"
 date: "2026-08-25"
 output: html_document
@@ -869,4 +869,40 @@ west_ephemeral_prox <- rast("~/Desktop/Arnhold/sparcle-hwc-old2/code/sparcle-hwc
 print(west_ephemeral_prox)
 plot(west_ephemeral_prox)
 ```
+
+```{r}
+#==============================
+#Looking at Conflict Data 
+#==============================
+
+library(sf)
+
+# Load the shapefile
+shp <- st_read("~/Desktop/Arnhold/sparcle-hwc-old2/code/sparcle-hwc/data/conflict_data")
+
+# Inspect structure, attributes, CRS, and bounding box
+print(shp)
+
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
