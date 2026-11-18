@@ -697,11 +697,11 @@ plet(res_kaza_wet$mean_lp, col = rev(terrain.colors(100)), tiles = "OpenStreetMa
 plet(res_kaza_dry$mean_lp, col = rev(terrain.colors(100)), tiles = "OpenStreetMap")
 ```
 
-KAZA updated
+KAZA updated using v2 covariates 
 
 ```{r}
 # ------------------------------------------------------------
-#Resistance sutface for KAZA wet/dry 
+#Resistance sutface for KAZA wet/dry v2
 # ------------------------------------------------------------
 
 library(tidyverse)
@@ -1036,8 +1036,6 @@ plot(res_kaza_wet$mean_lp, main = "KAZA Wet Resistance (mean LP)")
 plot(res_kaza_dry$mean_lp,main = "KAZA Dry Resistance (mean LP)")
 plet(res_kaza_wet$mean_lp, col = rev(terrain.colors(100)), tiles = "OpenStreetMap")
 plet(res_kaza_dry$mean_lp, col = rev(terrain.colors(100)), tiles = "OpenStreetMap")
-
-plot(res_kaza_wet$by_year[["2020"]])
 ```
 
 ```{r}
@@ -1358,4 +1356,13 @@ plot_res_with_steps <- function(res_by_year, season_name) {
 plot_res_with_steps(res_etosha_wet$by_year, "wet")   # 2010, 2011, 2012
 plot_res_with_steps(res_etosha_dry$by_year, "dry")   # 2009, 2010, 2011
 ```
+
+
+
+
+
+
+
+
+
 
