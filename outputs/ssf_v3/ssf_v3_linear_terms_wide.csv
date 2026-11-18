@@ -1,0 +1,7 @@
+term,etosha_wet,etosha_dry,west_wet,west_dry,kaza_wet,kaza_dry
+water_rivers_dist,1.000**,1.000*,1.000,1.000,1.000,1.000***
+ephemeral_rivers_dist,0.989**,0.996,1.010*,1.022***,0.986***,0.987***
+river_cross,NA,NA,NA,NA,0.494***,0.533***
+ephemeral_cross,1.161***,1.009,1.352***,1.195***,1.058***,1.097***
+fence_cross,0.342***,0.388***,0.454***,0.370***,0.122***,0.117***
+road_cross,0.676***,0.784***,0.842***,0.775***,0.778***,1.311***

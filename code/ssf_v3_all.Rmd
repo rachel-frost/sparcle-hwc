@@ -1,0 +1,168 @@
+---
+title: "ssf_v3_all_pops"
+output: html_document
+date: "2026-11-18"
+---
+
+```{r setup}
+library(tidyverse)
+library(survival)
+select <- dplyr::select
+filter <- dplyr::filter
+```
+
+## Settings
+
+```{r paths}
+# Project root set directly (here() was resolving to Downloads)
+ROOT <- path.expand("~/Desktop/Bren - Data Science/emLab/sparcle-hwc")
+stopifnot(dir.exists(ROOT))
+out_path <- function(...) file.path(ROOT, "outputs", ...)
+
+STEP_FILES <- tribble(
+  ~pop,     ~season, ~path,
+  "etosha", "wet",   out_path("ele_trk_extract_etosha_wet_v2.rds"),
+  "etosha", "dry",   out_path("ele_trk_extract_etosha_dry_v2.rds"),
+  "west",   "wet",   out_path("ele_trk_extract_west_wet_v2.rds"),
+  "west",   "dry",   out_path("ele_trk_extract_west_dry_v2.rds"),
+  "kaza",   "wet",   out_path("ele_trk_extract_kaza_wet_v2.rds"),
+  "kaza",   "dry",   out_path("ele_trk_extract_kaza_dry_v2.rds")
+)
+
+STRATA_COL     <- "step_id_"
+MIN_USED_CROSS <- 50
+RUN_SL_CHECK   <- FALSE   # TRUE refits every model with sl_m + log_sl_m (doubles run time)
+OUT_DIR        <- out_path("ssf_v3")
+dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+hab_terms   <- c("elevation", "slope", "aspect", "evi", "world_pop", "tree_cover", "shrubland",
+                 "grassland", "cropland_dist", "urban_dist")
+dist_terms  <- c("water_rivers_dist", "ephemeral_rivers_dist")   # rivers only; no fence_dist or road_dist
+cross_terms <- c("river_cross", "ephemeral_cross", "fence_cross", "road_cross")
+
+missing_files <- STEP_FILES$path[!file.exists(STEP_FILES$path)]
+if (length(missing_files)) stop("Missing files:\n", paste(missing_files, collapse = "\n"))
+```
+
+## Checkpoint 1: columns and crossing counts
+
+Loads each file once, one at a time. Fix any missing columns before fitting.
+
+```{r check}
+case_col <- function(d) intersect(c("case_", "case"), names(d))[1]
+
+# Strata must be unique per elephant. KAZA's step_id_ restarts per animal, so
+# combine with the elephant ID everywhere (harmless where it's already combined).
+ID_COL <- "id"
+add_strata <- function(d) {
+  if (!ID_COL %in% names(d)) stop("No '", ID_COL, "' column. Set ID_COL to the elephant ID column name.")
+  d$strata_key <- paste(d[[ID_COL]], d[[STRATA_COL]], sep = "__")
+  d
+}
+
+pre <- pmap_dfr(STEP_FILES, function(pop, season, path) {
+  d  <- readRDS(path) |> add_strata()
+  cc <- case_col(d)
+  needed <- c(hab_terms, dist_terms, STRATA_COL)
+  miss   <- setdiff(needed, names(d))
+  used   <- d[[cc]] == 1
+  cross  <- map_dfr(intersect(cross_terms, names(d)), ~ tibble(
+    term = .x,
+    n_used_cross = sum(d[[.x]][used], na.rm = TRUE),
+    ratio_used_random = mean(d[[.x]][used], na.rm = TRUE) / mean(d[[.x]][!used], na.rm = TRUE)))
+  spk <- table(d$strata_key)
+  out <- tibble(pop, season, rows = nrow(d), strata_old = n_distinct(d[[STRATA_COL]]),
+                strata = length(spk), rows_per_stratum = round(nrow(d) / length(spk), 1),
+                used_per_stratum_max = max(tapply(d[[cc]] == 1, d$strata_key, sum)),
+                missing_core = paste(miss, collapse = ", "),
+                missing_cross = paste(setdiff(cross_terms, names(d)), collapse = ", "),
+                cross = list(cross))
+  rm(d); gc(); out
+})
+
+pre |> select(-cross) |> print()
+# Every stratum should have exactly 1 used step and rows_per_stratum should be ~11 everywhere
+if (any(pre$used_per_stratum_max != 1)) stop("Some strata have more than 1 used step. Check ID_COL / step_id_.")
+pre |> select(pop, season, cross) |> unnest(cross) |> print(n = Inf)
+
+if (any(pre$missing_core != ""))
+  stop("A habitat/distance column is missing above. Fix before fitting.")
+```
+
+Note: Etosha's perennial rivers were merged into ephemeral, so `river_cross` should be 0 there and will drop out automatically.
+
+## Fit the 6 models
+
+```{r fit}
+fit_one <- function(terms, d) {
+  f <- reformulate(c(terms, "strata(strata_key)"), response = "case_")
+  clogit(f, data = d, model = FALSE)
+}
+
+tidy_ci <- function(m) {
+  s <- summary(m)$coefficients; ci <- confint(m)
+  tibble(term = rownames(s), coef = s[, "coef"], se = s[, "se(coef)"],
+         exp_coef = exp(s[, "coef"]), lo95 = exp(ci[, 1]), hi95 = exp(ci[, 2]), p = s[, "Pr(>|z|)"])
+}
+
+results <- list()
+for (i in seq_len(nrow(STEP_FILES))) {
+  pop <- STEP_FILES$pop[i]; season <- STEP_FILES$season[i]; key <- paste(pop, season, sep = "_")
+  cat("\n== fitting", key, "==\n")
+
+  d <- readRDS(STEP_FILES$path[i]) |> add_strata()
+  if (!"case_" %in% names(d)) d <- rename(d, case_ = case)
+
+  cs   <- pre$cross[[i]]
+  keep <- cs$term[cs$n_used_cross >= MIN_USED_CROSS]
+  drop <- setdiff(cross_terms, keep)
+  cat("Crossing terms kept:", paste(keep, collapse = ", "),
+      "| dropped (<", MIN_USED_CROSS, "used crossings or missing):", paste(drop, collapse = ", "), "\n")
+
+  terms <- c(hab_terms, dist_terms, keep)
+  d <- d |> select(all_of(c("case_", "strata_key", terms)), any_of(c("sl_m", "log_sl_m"))) |> drop_na(all_of(terms))
+  m <- fit_one(terms, d)
+
+  coefs <- tidy_ci(m) |> mutate(pop = pop, season = season, .before = 1)
+  write_csv(coefs, file.path(OUT_DIR, sprintf("ssf_v3_%s.csv", key)))
+
+  shift <- NULL
+  if (RUN_SL_CHECK && all(c("sl_m", "log_sl_m") %in% names(d))) {
+    m_sl  <- fit_one(c(terms, "sl_m", "log_sl_m"), d)
+    shift <- coefs |> select(term, coef, se) |>
+      inner_join(tidy_ci(m_sl) |> select(term, coef_sl = coef), by = "term") |>
+      mutate(shift_se = (coef_sl - coef) / se)
+    rm(m_sl)
+  }
+
+  results[[key]] <- list(coefs = coefs, shift = shift, dropped = drop,
+                         fit = tibble(pop, season, n = m$n, n_events = m$nevent,
+                                      AIC = AIC(m), BIC = BIC(m), terms = length(terms)))
+  rm(d, m); gc()
+}
+saveRDS(results, file.path(OUT_DIR, "ssf_v3_results.rds"))
+```
+
+## Results
+
+```{r results}
+fit_tab <- map_dfr(results, "fit") |>
+  mutate(dropped_cross = map_chr(results, ~ paste(.x$dropped, collapse = ", ")))
+print(fit_tab)
+
+all_coefs <- map_dfr(results, "coefs")
+write_csv(all_coefs, file.path(OUT_DIR, "ssf_v3_all_coefs.csv"))
+
+# Linear-feature terms side by side: exp(coef) with significance stars
+stars <- function(p) case_when(p < 0.001 ~ "***", p < 0.01 ~ "**", p < 0.05 ~ "*", TRUE ~ "")
+lin_wide <- all_coefs |>
+  filter(term %in% c(dist_terms, cross_terms)) |>
+  mutate(cell = sprintf("%.3f%s", exp_coef, stars(p)), model = paste(pop, season, sep = "_")) |>
+  select(term, model, cell) |>
+  pivot_wider(names_from = model, values_from = cell) |>
+  arrange(factor(term, levels = c(dist_terms, cross_terms)))
+print(lin_wide)
+write_csv(lin_wide, file.path(OUT_DIR, "ssf_v3_linear_terms_wide.csv"))
+
+if (RUN_SL_CHECK) map_dfr(results, "shift", .id = "model") |> filter(abs(shift_se) > 2) |> print(n = Inf)
+```
