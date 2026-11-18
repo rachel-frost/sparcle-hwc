@@ -870,22 +870,97 @@ print(west_ephemeral_prox)
 plot(west_ephemeral_prox)
 ```
 
+
+#==============================
+#CONFLICT DATA EXPLORATION 
+#==============================
+
+
 ```{r}
 #==============================
 #Looking at Conflict Data 
 #==============================
+library(dplyr)
 
-library(sf)
+# 1. Load and prepare your shapefile
+conflict_data <- st_read("~/Desktop/Arnhold/sparcle-hwc-old2/code/sparcle-hwc/data/conflict_data/filt_to_nearest_conserv_grid.shp") %>%
+  st_transform(crs = 4326) %>%
+  st_make_valid()
 
-# Load the shapefile
-shp <- st_read("~/Desktop/Arnhold/sparcle-hwc-old2/code/sparcle-hwc/data/conflict_data")
+# Optional: Replace any blank/NA values in CATEGORY so they get a proper label
+conflict_data <- conflict_data %>%
+  mutate(CATEGORY = ifelse(is.na(CATEGORY) | CATEGORY == "", "Unknown", as.character(CATEGORY)))
 
-# Inspect structure, attributes, CRS, and bounding box
-print(shp)
+# 2. Use 'viridis' so it supports any number of categories without turning white
+pal <- colorFactor(
+  palette = "viridis",
+  domain = conflict_data$CATEGORY,
+  na.color = "#808080" # Makes any remaining missing values grey instead of white
+)
 
+# 3. Hover labels
+popup_labels <- paste0(
+  "<strong>Name: </strong>", conflict_data$NAME, "<br>",
+  "<strong>Category: </strong>", conflict_data$CATEGORY, "<br>",
+  "<strong>Status: </strong>", conflict_data$STATUS, "<br>",
+  "<strong>Region: </strong>", conflict_data$REGION, "<br>",
+  "<strong>Year: </strong>", conflict_data$YEAR_REG, "<br>",
+  "<strong>Month: </strong>", conflict_data$MONTH_REG 
+) %>% lapply(htmltools::HTML)
+
+# 4. Build the map using Esri WorldGrayCanvas (no API key needed)
+leaflet(data = conflict_data) %>%
+  addProviderTiles(providers$Esri.WorldGrayCanvas) %>% # Alternative: just use addTiles() for standard OpenStreetMap
+  addPolygons(
+    fillColor = ~pal(CATEGORY),
+    weight = 1,
+    opacity = 1,
+    color = "#333333",  # Dark grey borders so polygons are always visible
+    fillOpacity = 0.75,
+    highlightOptions = highlightOptions(
+      weight = 3,
+      color = "#000000",
+      fillOpacity = 0.9,
+      bringToFront = TRUE
+    ),
+    label = popup_labels
+  ) %>%
+  addLegend(
+    pal = pal,
+    values = ~CATEGORY,
+    opacity = 0.75,
+    title = "Conflict Category",
+    position = "bottomright"
+  )
 
 
 ```
+
+```{r}
+print(conflict_data)
+```
+```{r}
+# 1. Count the number of conflicts per year (excluding missing years)
+year_counts <- table(conflict_data$YEAR_REG)
+
+# 2. Plot a horizontal bar chart (Count on X-axis, Year on Y-axis)
+barplot(
+  year_counts,
+  horiz = FALSE,                 # Flips axes so counts are on X and years are on Y
+  las = 1,                      # Rotates Y-axis year labels so they read horizontally
+  col = "#d95f02",              # Bar color
+  border = NA,                  # Removes harsh bar borders
+  xlab = "Number of Conflicts", # X-axis label
+  ylab = "Year",                # Y-axis label
+  main = "Number of Conflicts by Year"
+)
+
+```
+
+
+
+
+
 
 
 
