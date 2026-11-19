@@ -406,6 +406,344 @@ summary_table |>
 The within-stratum result looks better than the Boyce result. That fits the idea that the SSF discriminates well within strata, while the pooled, cross-elephant Boyce is noisy because of variation between individuals.
 
 
+#==============================================
+#Boyce Cross-Validation on V3
+#==============================================
+
+```{r}
+# =============================================================================
+# CONTINUOUS BOYCE INDEX VALIDATION FOR Etosha, West and KAZA
+# (matches the SSF v3 script: same files, covariates, crossing rule and strata)
+# =============================================================================
+
+
+#0. Packages
+library(tidyverse)
+library(survival)   # clogit()
+library(modEvA)     # Boyce()
+# CHANGED: here() dropped. Paths now come from ROOT, as in the SSF script (here() was resolving to Downloads)
+select <- dplyr::select   # NEW: same masking fix as the SSF script
+filter <- dplyr::filter
+
+set.seed(123)       # fold assignment is random
+
+
+#0b. Settings
+# CHANGED: project root and file table copied from the SSF v3 script, so both scripts read the same files.
+# CHANGED: project root updated for the new machine/folder (outputs/ssf_v3 lives under this)
+ROOT <- path.expand("~/Desktop/Arnhold/sparcle-hwc-old2/code/sparcle-hwc")
+stopifnot(dir.exists(ROOT))
+out_path <- function(...) file.path(ROOT, "outputs", ...)
+
+# The v2 files are seasonal, each already with a `season` column and step_id_ unique per elephant.
+# To run only some populations, filter this table, e.g.
+# STEP_FILES <- filter(STEP_FILES, pop %in% c("etosha", "kaza"))
+# (cached results for the other populations in the boyce folder are not touched).
+# CHANGED: step data live in data/ele_trk_data on this machine (found with list.files)
+step_dir <- file.path(ROOT, "data", "ele_trk_data")
+
+STEP_FILES <- tribble(
+  ~pop,     ~season, ~path,
+  "etosha", "wet",   file.path(step_dir, "ele_trk_extract_etosha_wet_v2.rds"),
+  "etosha", "dry",   file.path(step_dir, "ele_trk_extract_etosha_dry_v2.rds"),
+  "west",   "wet",   file.path(step_dir, "ele_trk_extract_west_wet_v2.rds"),
+  "west",   "dry",   file.path(step_dir, "ele_trk_extract_west_dry_v2.rds"),
+  "kaza",   "wet",   file.path(step_dir, "ele_trk_extract_kaza_wet_v2.rds"),
+  "kaza",   "dry",   file.path(step_dir, "ele_trk_extract_kaza_dry_v2.rds")
+)
+
+missing_files <- STEP_FILES$path[!file.exists(STEP_FILES$path)]
+if (length(missing_files)) stop("Missing files:\n", paste(missing_files, collapse = "\n"))
+
+STRATA_COL <- "step_id_"
+ID_COL     <- "id"
+
+# Crossing terms with fewer used crossings than this are dropped (a term with ~0 used crossings
+# in a training fold gives a runaway coefficient).
+# 50 = same rule as MIN_USED_CROSS in the SSF scripts.
+# CHANGED: the rule is now applied per population x season file (as in the SSF v3 script),
+# no longer "in EITHER season" across both seasons.
+MIN_USED_CROSS <- 50
+
+missing_files <- STEP_FILES$path[!file.exists(STEP_FILES$path)]
+if (length(missing_files)) stop("Missing files:\n", paste(missing_files, collapse = "\n"))
+
+
+#1. Where the extracted step data live, and how to load them
+# The v2 files ALREADY contain river_cross / ephemeral_cross / fence_cross / road_cross, so crossings
+# are NOT rebuilt from the old *_linear columns (that would overwrite the vector crossings).
+# CHANGED: add_crossings() and lin_cols are removed because every population now comes from a v2 file.
+# Each file is loaded inside the loop (section 7), trimmed to the columns needed, and dropped
+# afterwards (KAZA + Etosha together is a lot of RAM).
+
+
+#2. Choose covariates and settings
+# CHANGED: same covariates as the SSF v3 script.
+# hab_terms  = habitat covariates
+# dist_terms = river distances only (no fence_dist or road_dist; fences and roads enter as crossings)
+# cross_terms = crossing indicators (kept per file only if enough used crossings)
+hab_terms   <- c("elevation", "slope", "aspect", "evi", "world_pop", "tree_cover", "shrubland",
+                 "grassland", "cropland_dist", "urban_dist")
+dist_terms  <- c("water_rivers_dist", "ephemeral_rivers_dist")
+cross_terms <- c("river_cross", "ephemeral_cross", "fence_cross", "road_cross")
+
+k_folds <- 5     #number of CV folds (capped at the number of elephants)
+bin_width <- 0.1   #moving-window width, in units of the prediction scale
+n_windows <- 100   #number of window positions along the gradient (modEvA `res`)
+pred_scale <- "rank"  # "rank" or "lp" -- see section 6 for the decision
+n_per_stratum <- 11   # 1 used + 10 random steps
+
+# CHANGED: cache folder moved next to the SSF v3 outputs so v3 results don't mix with the old ones
+boyce_dir <- out_path("ssf_v3", "boyce")
+dir.create(boyce_dir, showWarnings = FALSE, recursive = TRUE)
+
+
+# Load one file, keeping only the columns the model needs (saves memory)
+# CHANGED: mirrors the SSF v3 prep. Builds strata_key = elephant id + step_id_.
+# NEW: strata must be unique across elephants, or whole-elephant folds would split strata.
+# KAZA's step_id_ restarts per animal, so combine with the elephant ID everywhere
+# (harmless where it's already combined).
+load_step_file <- function(path) {
+  d <- readRDS(path) |> as_tibble()
+  if (!"case_" %in% names(d)) d <- rename(d, case_ = case)
+  d$case_ <- as.logical(d$case_ == 1)      # works whether case_ is logical or 0/1
+  if (!ID_COL %in% names(d)) stop("No '", ID_COL, "' column in ", path)
+  d$strata_key <- paste(d[[ID_COL]], d[[STRATA_COL]], sep = "__")
+
+  # NEW: which crossing terms have enough USED crossings in this file to be estimated?
+  have  <- intersect(cross_terms, names(d))
+  n_use <- map_int(have, ~ as.integer(sum(d[[.x]][d$case_], na.rm = TRUE)))
+  keep  <- have[n_use >= MIN_USED_CROSS]
+  drop  <- setdiff(cross_terms, keep)
+
+  terms <- c(hab_terms, dist_terms, keep)
+  stopifnot(all(terms %in% names(d)))      # fails loudly if columns are missing
+
+  d <- d |>
+    select(all_of(c("case_", "strata_key", ID_COL, terms))) |>
+    #The same complete rows must be used to fit and to score, so drop NAs in any model covariate up front.
+    # CHANGED: no more fill_lc_na (missing land cover set to 0). The SSF v3 script just drops NA rows,
+    # so Boyce does the same to use identical rows.
+    drop_na(all_of(terms)) |>
+    # Dropping rows can orphan a stratum (case removed but controls kept, or
+    # vice versa). A stratum needs >= 1 case and >= 1 control to be informative.
+    group_by(strata_key) |>
+    filter(any(case_), any(!case_)) |>
+    ungroup()
+
+  list(data = d, terms = terms, dropped = drop)
+}
+
+
+#4.Assign whole elephants to folds
+# Called once per population x season, so folds are reproducible
+# CHANGED: with one model per file there are no scenarios to share folds across
+make_folds <- function(data, k) {
+  ids <- unique(data[[ID_COL]])
+  k   <- min(k, length(ids))             #can't have more folds than animals
+  fold_tbl <- tibble(!!ID_COL := sample(ids),   #shuffle animals, then deal into folds
+                     fold = rep_len(seq_len(k), length(ids)))
+  left_join(data, fold_tbl, by = ID_COL)
+}
+
+
+#Fit the SSF and score new steps
+# CHANGED: strata(strata_key) instead of strata(step_id_), same as the SSF v3 fit
+fit_ssf <- function(train, terms) {
+  f <- reformulate(c(terms, "strata(strata_key)"), response = "case_")
+  # With one used step per stratum, method = "efron" gives the same estimates
+  # as clogit's default "exact", but is much faster on millions of rows.
+  clogit(f, data = train, method = "efron", model = FALSE)
+}
+
+# Linear predictor for new data: X %*% beta (log relative selection strength).
+score_steps <- function(fit, newdata) {
+  b <- coef(fit)
+  b <- b[!is.na(b)]
+  X <- as.matrix(newdata[, names(b)])
+  drop(X %*% b)
+}
+
+
+#6.Cross-validated Boyce for one model
+# NEW: `data` already has a fold column; `meta` carries population/season labels
+run_ssf_boyce <- function(data, terms, label, meta) {
+
+  folds <- sort(unique(data$fold))
+  oof   <- list()   #out-of-fold predictions, kept for the pooled plot
+  res   <- list()   #one row of summary stats per fold
+
+  for (f in folds) {
+    message(label, ": fold ", f, " of ", length(folds))
+
+    train <- filter(data, fold != f)
+    test  <- filter(data, fold == f)
+
+    fit <- fit_ssf(train, terms)
+    test$lp <- score_steps(fit, test)      # log-RSS of every held-out step
+
+
+    #Scale is "rank": Converts the linear predictor into a uniform percentile rank from 0 to 1. Every window gets a roughly equal number of data points, making the P/E ratio stable across the gradient. Boyce is rank-based anyway (Spearman).
+    test$pred <- if (pred_scale == "rank") percent_rank(test$lp) else test$lp
+
+    #`obs` must be numeric 0/1 (1 = used step, 0 = random step).
+    #modEvA compares predictions at used steps against predictions across
+    #ALL steps, i.e. presence vs "available".
+    b <- Boyce(obs = as.numeric(test$case_),
+               pred = test$pred,
+               n.bins = NA,                # NA = continuous moving window
+               bin.width = if (pred_scale == "rank") bin_width else "default",
+               res = n_windows,
+               method = "spearman",
+               rm.dup.classes = FALSE,
+               plot = FALSE)
+
+    res[[f]] <- tibble(
+      meta,                                # NEW: population / season
+      label = label, fold = f,
+      n_elephants = n_distinct(test[[ID_COL]]),
+      n_used_steps = sum(test$case_),
+      boyce = b$B,
+      #modEvA flags windows with < 30 points (their P/E ratio is noisy)
+      n_small_bins = sum(b$bins$bin.N < 30, na.rm = TRUE)
+    )
+    oof[[f]] <- test |> select(strata_key, case_, lp, pred, fold)
+    rm(train, test, fit); gc()             # free memory between folds
+  }
+
+  oof <- bind_rows(oof)
+
+  #Pooled out-of-fold P/E curve
+  # A good model gives a monotonically increasing curve. Pooling predictions across folds gives one curve per model.
+  Boyce(obs = as.numeric(oof$case_), pred = oof$pred,
+        bin.width = if (pred_scale == "rank") bin_width else "default",
+        res = n_windows, plot = TRUE,
+        main = paste("Boyce (out-of-fold):", label))
+
+  #Check: within-stratum rank of the used step
+  # Because an SSF compares each used step to ITS OWN random steps, also ask:
+  # where does the used step rank among the steps in its stratum?
+  # (Fortin et al. 2009-style). If the model works, used steps should land at
+  # the high ranks far more often than the 1/n expected by chance.
+  # n_per_stratum replaces the max(table(...)) lookup (slow on millions of rows);
+  # complete() fills ranks with zero counts so the correlation is always over 1:11
+  strata_check <- oof |>
+    group_by(strata_key) |>
+    filter(n() == n_per_stratum) |>                # keep complete strata (e.g. 11 steps)
+    mutate(rank_in_stratum = rank(lp, ties.method = "random")) |>  #method for ranking steps. So when there are steps of identical score, this tie is shuffled so that they are equally likely to land at any position in it rather than "first", which ranks whichever step comes first, which is always the used one, which gets ranked lowest every time then.
+    ungroup() |>
+    filter(case_) |>
+    count(rank_in_stratum, name = "n_used") |>
+    complete(rank_in_stratum = 1:n_per_stratum, fill = list(n_used = 0))
+
+  within_stratum_rho <- cor(strata_check$rank_in_stratum, strata_check$n_used,
+                            method = "spearman")
+
+  # NEW: tie check (moved here from the separate chunk, so it runs for every model).
+  # share_all_identical = share of strata where all 11 steps score identically
+  # share_any_tie       = share of strata with at least one tie
+  # Etosha dry result from before:
+  # 6.2e-05: only about 0.006% of strata have all 11 steps scoring identically. Almost every stratum has some variation for the model to use.
+  # 0.943: about 94% of strata have at least one tie among their 11 steps. Ties are everywhere, but mostly partial, such as two or three steps sharing a pixel.
+  ties <- oof |>
+    group_by(strata_key) |>
+    summarise(n_unique = n_distinct(lp), .groups = "drop") |>
+    summarise(share_all_identical = mean(n_unique == 1),
+              share_any_tie       = mean(n_unique < n_per_stratum))
+
+  list(label = label,
+       terms = terms,                       # NEW: stored so the cache can tell if the model changed
+       folds = bind_rows(res),
+       oof = oof,
+       within_stratum_counts = strata_check,
+       within_stratum_rho = within_stratum_rho,
+       ties = ties)
+}
+
+
+#7. Run for each population x season
+# CHANGED: one model per file (the three scenarios are gone, since the SSF v3 fits one model per file).
+# Each result is cached so reruns skip finished models.
+# Each file is loaded here, then released before the next one.
+# NOTE: CHANGED: a cached result is reused only if its stored term list is identical to the current one.
+# If you change the covariates or crossing terms it refits automatically. If you change the INPUT FILES
+# (same terms, new data), delete the matching file in outputs/ssf_v3/boyce so it is refit.
+boyce_results <- list()
+
+for (i in seq_len(nrow(STEP_FILES))) {
+  pop <- STEP_FILES$pop[i]; szn <- STEP_FILES$season[i]
+  label <- paste(pop, szn)
+  path  <- file.path(boyce_dir, paste0(pop, "_", szn, ".rds"))
+
+  message("Loading ", label, " ...")
+  ld <- load_step_file(STEP_FILES$path[i])
+  message(label, ": terms = ", paste(ld$terms, collapse = ", "),
+          " | dropped crossings (< ", MIN_USED_CROSS, " used crossings or missing): ",
+          paste(ld$dropped, collapse = ", "))
+
+  cached <- if (file.exists(path)) readRDS(path) else NULL
+  if (!is.null(cached) && identical(sort(cached$terms), sort(ld$terms))) {
+    message(label, ": using cached result")
+    boyce_results[[label]] <- cached
+  } else {
+    set.seed(123)                      # same fold assignment on every rerun
+    d <- make_folds(ld$data, k_folds)
+    meta <- tibble(population = pop, season = szn)
+    boyce_results[[label]] <- run_ssf_boyce(d, ld$terms, label, meta)
+    saveRDS(boyce_results[[label]], path)
+    rm(d)
+  }
+  rm(ld); gc()
+}
+
+
+#8. Summarise
+# Per-fold Boyce, then mean and SD across folds for each model.
+fold_table <- map_dfr(boyce_results, "folds")
+fold_table
+
+summary_table <- fold_table |>
+  group_by(population, season) |>
+  summarise(mean_boyce = mean(boyce),
+            sd_boyce   = sd(boyce),
+            min_boyce  = min(boyce),
+            max_boyce  = max(boyce),
+            .groups = "drop") |>
+  left_join(tibble(label = names(boyce_results),
+                   within_stratum_rho  = map_dbl(boyce_results, "within_stratum_rho"),
+                   share_all_identical = map_dbl(boyce_results, ~ .x$ties$share_all_identical),
+                   share_any_tie       = map_dbl(boyce_results, ~ .x$ties$share_any_tie)) |>
+              separate(label, c("population", "season"), sep = " "),
+            by = c("population", "season"))
+summary_table
+
+#Frequency of used steps at each within-stratum rank (should climb toward the top rank)
+map(boyce_results, "within_stratum_counts")
+
+write_csv(fold_table,    file.path(boyce_dir, "boyce_v3_fold_table.csv"))
+write_csv(summary_table, file.path(boyce_dir, "boyce_v3_summary.csv"))
+
+
+# Column check (data are no longer kept in memory after the loop, so this loads each file).
+# Every covariate the models expect but the data lacks (should be character(0) for each):
+if (FALSE) {
+  for (i in seq_len(nrow(STEP_FILES))) {
+    d <- readRDS(STEP_FILES$path[i])
+    cat(STEP_FILES$pop[i], STEP_FILES$season[i], "- missing:",
+        setdiff(c(hab_terms, dist_terms, ID_COL, STRATA_COL), names(d)), "\n")
+    rm(d); gc()
+  }
+}
+```
+
+```{r}
+# Find the v2 step files anywhere under the project folder
+found <- list.files(ROOT, pattern = "ele_trk_extract_.*_v2\\.rds$",
+                    recursive = TRUE, full.names = TRUE)
+found
+```
+
+
 
 
 
