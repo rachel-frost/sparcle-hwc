@@ -1,12 +1,14 @@
 ---
 title: "ssf_v3_all_pops"
 output: html_document
-date: "2026-11-18"
+date: "11/18/26"
 ---
 
 ```{r setup}
 library(tidyverse)
 library(survival)
+library(sf)      # new
+library(terra)   # new
 select <- dplyr::select
 filter <- dplyr::filter
 ```
@@ -15,11 +17,11 @@ filter <- dplyr::filter
 
 ```{r paths}
 # Project root set directly (here() was resolving to Downloads)
-ROOT <- path.expand("~/Desktop/Bren - Data Science/emLab/sparcle-hwc")
-stopifnot(dir.exists(ROOT))
-out_path <- function(...) file.path(ROOT, "outputs", ...)
+root <- path.expand("~/Desktop/Bren - Data Science/emLab/sparcle-hwc")
+stopifnot(dir.exists(root))
+out_path <- function(...) file.path(root, "outputs", ...)
 
-STEP_FILES <- tribble(
+step_files <- tribble(
   ~pop,     ~season, ~path,
   "etosha", "wet",   out_path("ele_trk_extract_etosha_wet_v2.rds"),
   "etosha", "dry",   out_path("ele_trk_extract_etosha_dry_v2.rds"),
@@ -29,19 +31,47 @@ STEP_FILES <- tribble(
   "kaza",   "dry",   out_path("ele_trk_extract_kaza_dry_v2.rds")
 )
 
-STRATA_COL     <- "step_id_"
-MIN_USED_CROSS <- 50
-RUN_SL_CHECK   <- FALSE   # TRUE refits every model with sl_m + log_sl_m (doubles run time)
-OUT_DIR        <- out_path("ssf_v3")
-dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+strata_col     <- "step_id_"
+min_used_cross <- 50
+run_sl_check   <- FALSE   # TRUE refits every model with sl_m + log_sl_m (doubles run time)
+compare_road   <- FALSE   # changed: TRUE also fits without the road term on the same rows (doubles run time); road_forms_aic.rds already has this
+out_dir        <- out_path("ssf_v3")  
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 
 hab_terms   <- c("elevation", "slope", "aspect", "evi", "world_pop", "tree_cover", "shrubland",
                  "grassland", "cropland_dist", "urban_dist")
-dist_terms  <- c("water_rivers_dist", "ephemeral_rivers_dist")   # rivers only; no fence_dist or road_dist
+road_term   <- "road_log"   # new: log(road distance km + 0.25); lowest total ΔAIC in the road-forms test
+dist_terms  <- c("water_rivers_dist", "ephemeral_rivers_prox", road_term)   # changed: ephemeral prox (neg exp decay) + log roads
 cross_terms <- c("river_cross", "ephemeral_cross", "fence_cross", "road_cross")
 
-missing_files <- STEP_FILES$path[!file.exists(STEP_FILES$path)]
+missing_files <- step_files$path[!file.exists(step_files$path)]
 if (length(missing_files)) stop("Missing files:\n", paste(missing_files, collapse = "\n"))
+```
+
+## Road distance raster
+
+Built once from the same road vector used for `road_cross`, on the 500 m fence-distance grid.
+
+```{r road-dist-raster}
+road_dist_path <- file.path(root, "data", "Linear_features", "dist_roads_500m.tif")
+
+if (!file.exists(road_dist_path)) {
+  roads  <- st_read(file.path(root, "data", "Linear_features", "roads_selected_exported.shp"), quiet = TRUE) |> st_zm()
+  tmpl   <- rast(file.path(root, "data", "Linear_features", "all_vet_fences", "dist_vetfences_500m.tif"))
+  road_r <- rasterize(vect(st_transform(roads, crs(tmpl))), tmpl, field = 1, touches = TRUE)
+  writeRaster(distance(road_r), road_dist_path, overwrite = TRUE)   # metres
+}
+road_dist_r <- rast(road_dist_path)
+global(road_dist_r, c("min", "max"), na.rm = TRUE)   # checkpoint: min 0, max tens of km
+
+add_road_dist <- function(d, pop) {
+  xy <- as.matrix(d[, c("x2_", "y2_")])
+  if (max(abs(xy[, 1]), na.rm = TRUE) > 180)
+    stop(pop, " step coordinates look projected; reproject them to lon/lat before extracting.")
+  d$road_dist <- terra::extract(road_dist_r, xy)[, 1] / 1000   # km
+  d$road_log <- log(d$road_dist + 0.25)
+  d
+}
 ```
 
 ## Checkpoint 1: columns and crossing counts
@@ -53,17 +83,17 @@ case_col <- function(d) intersect(c("case_", "case"), names(d))[1]
 
 # Strata must be unique per elephant. KAZA's step_id_ restarts per animal, so
 # combine with the elephant ID everywhere (harmless where it's already combined).
-ID_COL <- "id"
+id_col <- "id"
 add_strata <- function(d) {
-  if (!ID_COL %in% names(d)) stop("No '", ID_COL, "' column. Set ID_COL to the elephant ID column name.")
-  d$strata_key <- paste(d[[ID_COL]], d[[STRATA_COL]], sep = "__")
+  if (!id_col %in% names(d)) stop("No '", id_col, "' column. Set id_col to the elephant ID column name.")
+  d$strata_key <- paste(d[[id_col]], d[[strata_col]], sep = "__")
   d
 }
 
-pre <- pmap_dfr(STEP_FILES, function(pop, season, path) {
-  d  <- readRDS(path) |> add_strata()
+pre <- pmap_dfr(step_files, function(pop, season, path) {
+  d  <- readRDS(path) |> add_strata() |> add_road_dist(pop)   # changed
   cc <- case_col(d)
-  needed <- c(hab_terms, dist_terms, STRATA_COL)
+  needed <- c(hab_terms, dist_terms, strata_col)
   miss   <- setdiff(needed, names(d))
   used   <- d[[cc]] == 1
   cross  <- map_dfr(intersect(cross_terms, names(d)), ~ tibble(
@@ -71,7 +101,9 @@ pre <- pmap_dfr(STEP_FILES, function(pop, season, path) {
     n_used_cross = sum(d[[.x]][used], na.rm = TRUE),
     ratio_used_random = mean(d[[.x]][used], na.rm = TRUE) / mean(d[[.x]][!used], na.rm = TRUE)))
   spk <- table(d$strata_key)
-  out <- tibble(pop, season, rows = nrow(d), strata_old = n_distinct(d[[STRATA_COL]]),
+  out <- tibble(pop, season, rows = nrow(d),
+                road_dist_na = sum(is.na(d$road_dist)),   # new
+                strata_old = n_distinct(d[[strata_col]]),
                 strata = length(spk), rows_per_stratum = round(nrow(d) / length(spk), 1),
                 used_per_stratum_max = max(tapply(d[[cc]] == 1, d$strata_key, sum)),
                 missing_core = paste(miss, collapse = ", "),
@@ -82,7 +114,7 @@ pre <- pmap_dfr(STEP_FILES, function(pop, season, path) {
 
 pre |> select(-cross) |> print()
 # Every stratum should have exactly 1 used step and rows_per_stratum should be ~11 everywhere
-if (any(pre$used_per_stratum_max != 1)) stop("Some strata have more than 1 used step. Check ID_COL / step_id_.")
+if (any(pre$used_per_stratum_max != 1)) stop("Some strata have more than 1 used step. Check id_col / step_id_.")
 pre |> select(pop, season, cross) |> unnest(cross) |> print(n = Inf)
 
 if (any(pre$missing_core != ""))
@@ -106,28 +138,36 @@ tidy_ci <- function(m) {
 }
 
 results <- list()
-for (i in seq_len(nrow(STEP_FILES))) {
-  pop <- STEP_FILES$pop[i]; season <- STEP_FILES$season[i]; key <- paste(pop, season, sep = "_")
+for (i in seq_len(nrow(step_files))) {
+  pop <- step_files$pop[i]; season <- step_files$season[i]; key <- paste(pop, season, sep = "_")
   cat("\n== fitting", key, "==\n")
 
-  d <- readRDS(STEP_FILES$path[i]) |> add_strata()
+  d <- readRDS(step_files$path[i]) |> add_strata() |> add_road_dist(pop)   # changed
   if (!"case_" %in% names(d)) d <- rename(d, case_ = case)
 
   cs   <- pre$cross[[i]]
-  keep <- cs$term[cs$n_used_cross >= MIN_USED_CROSS]
+  keep <- cs$term[cs$n_used_cross >= min_used_cross]
   drop <- setdiff(cross_terms, keep)
   cat("Crossing terms kept:", paste(keep, collapse = ", "),
-      "| dropped (<", MIN_USED_CROSS, "used crossings or missing):", paste(drop, collapse = ", "), "\n")
+      "| dropped (<", min_used_cross, "used crossings or missing):", paste(drop, collapse = ", "), "\n")
 
   terms <- c(hab_terms, dist_terms, keep)
   d <- d |> select(all_of(c("case_", "strata_key", terms)), any_of(c("sl_m", "log_sl_m"))) |> drop_na(all_of(terms))
   m <- fit_one(terms, d)
 
+  # new: same rows, without road_dist, for a fair comparison
+  road_cmp <- NULL
+  if (compare_road) {
+    m_nr <- fit_one(setdiff(terms, road_term), d)
+    road_cmp <- tibble(dAIC_road = AIC(m) - AIC(m_nr), dBIC_road = BIC(m) - BIC(m_nr))
+    rm(m_nr)
+  }
+
   coefs <- tidy_ci(m) |> mutate(pop = pop, season = season, .before = 1)
-  write_csv(coefs, file.path(OUT_DIR, sprintf("ssf_v3_%s.csv", key)))
+  write_csv(coefs, file.path(out_dir, sprintf("ssf_v3_%s.csv", key)))
 
   shift <- NULL
-  if (RUN_SL_CHECK && all(c("sl_m", "log_sl_m") %in% names(d))) {
+  if (run_sl_check && all(c("sl_m", "log_sl_m") %in% names(d))) {
     m_sl  <- fit_one(c(terms, "sl_m", "log_sl_m"), d)
     shift <- coefs |> select(term, coef, se) |>
       inner_join(tidy_ci(m_sl) |> select(term, coef_sl = coef), by = "term") |>
@@ -136,11 +176,44 @@ for (i in seq_len(nrow(STEP_FILES))) {
   }
 
   results[[key]] <- list(coefs = coefs, shift = shift, dropped = drop,
-                         fit = tibble(pop, season, n = m$n, n_events = m$nevent,
-                                      AIC = AIC(m), BIC = BIC(m), terms = length(terms)))
+                         fit = bind_cols(tibble(pop, season, n = m$n, n_events = m$nevent,
+                                                AIC = AIC(m), BIC = BIC(m), terms = length(terms)),
+                                         road_cmp))   # changed
   rm(d, m); gc()
 }
-saveRDS(results, file.path(OUT_DIR, "ssf_v3_results.rds"))
+saveRDS(results, file.path(out_dir, "ssf_v3_results.rds"))
+```
+```{r road-forms, eval = FALSE}
+test_road_forms <- function(i) {
+  pop <- step_files$pop[i]; season <- step_files$season[i]
+  cat("== road forms:", pop, season, "==\n")
+  keep <- pre$cross[[i]] |> filter(n_used_cross >= min_used_cross) |> pull(term)
+  base <- c(hab_terms, setdiff(dist_terms, road_term), keep)
+
+  d <- readRDS(step_files$path[i]) |> add_strata() |> add_road_dist(pop)
+  if (!"case_" %in% names(d)) d <- rename(d, case_ = case)
+  d <- d |>
+    select(all_of(c("case_", "strata_key", base, "road_dist"))) |>
+    drop_na() |>
+    mutate(road_log     = log(road_dist + 0.25),
+           road_prox_1k = exp(-road_dist / 1),
+           road_prox_2k = exp(-road_dist / 2),
+           road_prox_5k = exp(-road_dist / 5))
+
+  forms <- c(none = NA, linear = "road_dist", log = "road_log",
+             prox_1k = "road_prox_1k", prox_2k = "road_prox_2k", prox_5k = "road_prox_5k")
+  out <- imap_dfr(forms, function(term, form) {
+    m <- fit_one(if (is.na(term)) base else c(base, term), d)
+    tibble(pop, season, form, AIC = AIC(m), BIC = BIC(m))
+  })
+  rm(d); gc()
+  out |> mutate(dAIC = AIC - min(AIC), dBIC = BIC - min(BIC))
+}
+
+# Etosha dry and West dry first (where road_dist matters most), then the rest if time
+road_forms <- map_dfr(c(2, 4), test_road_forms)
+road_forms |> select(pop, season, form, dAIC, dBIC) |> print(n = Inf)
+saveRDS(road_forms, file.path(out_dir, "road_forms_aic.rds"))
 ```
 
 ## Results
@@ -148,10 +221,10 @@ saveRDS(results, file.path(OUT_DIR, "ssf_v3_results.rds"))
 ```{r results}
 fit_tab <- map_dfr(results, "fit") |>
   mutate(dropped_cross = map_chr(results, ~ paste(.x$dropped, collapse = ", ")))
-print(fit_tab)
+print(fit_tab)   # negative dAIC_road = road_dist improves the model
 
 all_coefs <- map_dfr(results, "coefs")
-write_csv(all_coefs, file.path(OUT_DIR, "ssf_v3_all_coefs.csv"))
+write_csv(all_coefs, file.path(out_dir, "ssf_v3_all_coefs.csv"))
 
 # Linear-feature terms side by side: exp(coef) with significance stars
 stars <- function(p) case_when(p < 0.001 ~ "***", p < 0.01 ~ "**", p < 0.05 ~ "*", TRUE ~ "")
@@ -162,7 +235,7 @@ lin_wide <- all_coefs |>
   pivot_wider(names_from = model, values_from = cell) |>
   arrange(factor(term, levels = c(dist_terms, cross_terms)))
 print(lin_wide)
-write_csv(lin_wide, file.path(OUT_DIR, "ssf_v3_linear_terms_wide.csv"))
+write_csv(lin_wide, file.path(out_dir, "ssf_v3_linear_terms_wide.csv"))
 
-if (RUN_SL_CHECK) map_dfr(results, "shift", .id = "model") |> filter(abs(shift_se) > 2) |> print(n = Inf)
+if (run_sl_check) map_dfr(results, "shift", .id = "model") |> filter(abs(shift_se) > 2) |> print(n = Inf)
 ```
