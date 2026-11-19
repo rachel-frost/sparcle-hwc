@@ -331,8 +331,10 @@ res_kaza_wet <- run_resistance_all_years(ssf_results[["kaza_wet"]], "wet", pop_l
 res_kaza_dry <- run_resistance_all_years(ssf_results[["kaza_dry"]], "dry", pop_label, valid_area_kaza, common_clip = TRUE)
 
 # Visualize
-plot(res_kaza_wet$by_year[[c("2010", "2015", "2020")]])
-plot(res_kaza_dry$by_year[[c("2010", "2015", "2020")]])
+plot(res_kaza_wet$by_year[[c("2011")]])
+plot(res_kaza_wet$by_year[[c("2020")]])
+plot(res_kaza_dry$by_year[[c("2011")]])
+plot(res_kaza_dry$by_year[[c("2020")]])
 plot(res_kaza_wet$mean_lp, main = "KAZA Wet Resistance (mean LP)")
 plot(res_kaza_dry$mean_lp, main = "KAZA Dry Resistance (mean LP)")
 plet(res_kaza_wet$mean_lp, col = rev(terrain.colors(100)), tiles = "OpenStreetMap")
@@ -374,8 +376,8 @@ res_etosha_wet <- run_resistance_all_years(ssf_results[["etosha_wet"]], "wet", p
 res_etosha_dry <- run_resistance_all_years(ssf_results[["etosha_dry"]], "dry", pop_label, valid_area_etosha, common_clip = TRUE)
 
 # Visualize
-plot(res_etosha_wet$by_year[[c("2010", "2015", "2020")]])
-plot(res_etosha_dry$by_year[[c("2010", "2015", "2020")]])
+plot(res_etosha_wet$by_year[[c("2008", "2014")]])
+plot(res_etosha_dry$by_year[[c("2008", "2014")]])
 plot(res_etosha_wet$mean_lp, main = "Etosha Wet Resistance (mean LP)")
 plot(res_etosha_dry$mean_lp, main = "Etosha Dry Resistance (mean LP)")
 plet(res_etosha_wet$mean_lp, col = rev(terrain.colors(100)), tiles = "OpenStreetMap")
