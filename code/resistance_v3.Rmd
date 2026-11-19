@@ -32,6 +32,9 @@ dir.create(lp_folder,  showWarnings = FALSE, recursive = TRUE)
 linear_folder      <- path.expand("~/Desktop/Arnhold/sparcle-hwc-old2/code/sparcle-hwc/data/Linear_features")
 vet_fence_folder   <- file.path(linear_folder, "all_vet_fences")
 
+# NEW: road distance raster (metres), built once from roads_selected_exported.shp (see road distance chunk below)
+road_dist_path   <- file.path(linear_folder, "dist_roads_500m.tif")
+
 # UPDATED: lc_types split into distance-based and binary categorical
 lc_types    <- c("cropland", "grassland", "shrubland", "tree_cover", "urban", "water_rivers")
 lc_dist_types <- c("cropland", "urban", "water_rivers")        # still distance rasters
@@ -52,19 +55,25 @@ names(ssf_results)
 
 # 2. Build static covariate raster (seasonal)
 # ------------------------------------------------------------
-# UPDATED: fence_dist and road_dist REMOVED (v3 SSF has no distance-to-fence / distance-to-road term).
-# Fences and roads now enter ONLY as binary crossing layers in the linear feature stack below.
-# Also dropped core_dist and ephemeral_rivers_prox: they are not terms in the v3 models.
+# UPDATED: ephemeral rivers now enter as PROXIMITY (ephemeral_rivers_prox), not distance, and road distance is
+# BACK as road_log = log(road distance km + 0.25), matching the v3 SSF terms.
+# fence_dist is still REMOVED: fences enter ONLY as the binary fence_cross layer in the linear feature stack below.
+# Also dropped core_dist and ephemeral_rivers_dist: they are not terms in the v3 models.
 build_static_stack <- function() {
 
-  # UPDATED: ephemeral distance (km), as used in the SSF
-  eph_dist <- project(rast(file.path(linear_folder, paste0(pop_label, "_ephemeral_rivers_dist_1k_500m.tif"))), template, method = "bilinear") / 1000
-  names(eph_dist) <- "ephemeral_rivers_dist"
+  # UPDATED: ephemeral proximity exp(-d_km) (neg exp decay; already 0-1 in the file, so no unit conversion)
+  eph_prox <- project(rast(file.path(linear_folder, paste0(pop_label, "_ephemeral_rivers_prox_1k_500m.tif"))), template, method = "bilinear")
+  names(eph_prox) <- "ephemeral_rivers_prox"
+
+  # NEW: road distance (file is in metres) -> km -> log(km + 0.25), same transform used when extracting for the SSF
+  road_dist_r <- project(rast(road_dist_path), template, method = "bilinear") / 1000
+  road_log    <- log(road_dist_r + 0.25)
+  names(road_log) <- "road_log"
 
   terrain_r <- rast(file.path(gee_folder, "terrain_rast_500m.tif"))
   terrain_r <- project(terrain_r, template, method = "bilinear")
 
-  c(eph_dist, terrain_r)
+  c(eph_prox, road_log, terrain_r)
 }
 
 #Linear feature stack 
@@ -313,6 +322,36 @@ run_resistance_all_years <- function(model, season, pop_label, valid_area,
 
 ```{r}
 # ------------------------------------------------------------
+# Road distance raster (RUN ONCE)
+# ------------------------------------------------------------
+# NEW: road distance raster (metres), same recipe as the SSF script, but cropped to the study area so it runs fast
+if (!file.exists(road_dist_path)) {
+  library(sf)
+
+  roads <- st_read(file.path(linear_folder, "roads_selected_exported.shp"), quiet = TRUE) |> st_zm()
+  tmpl  <- rast(file.path(vet_fence_folder, "dist_vetfences_500m.tif"))   # 500 m grid used for the SSF road distance
+  ncell(tmpl)   # just to see how big the full grid is
+
+  # crop to the study area (KAZA's extent contains Etosha and West) plus a margin so distances near the edge stay correct
+  study_ext <- ext(project(as.polygons(ext(12, 26, -22, -16), crs = "EPSG:4326"), crs(tmpl)))
+  tmpl      <- crop(tmpl, study_ext)
+  ncell(tmpl)   # should be much smaller than above
+
+  roads_v <- crop(vect(st_transform(roads, crs(tmpl))), ext(tmpl))
+  road_r  <- rasterize(roads_v, tmpl, field = 1, touches = TRUE)
+
+  system.time(
+    writeRaster(distance(road_r), road_dist_path, overwrite = TRUE)   # metres
+  )
+}
+
+global(rast(road_dist_path), c("min", "max"), na.rm = TRUE)   # checkpoint: min 0, max in the tens of thousands (metres)
+```
+
+
+
+```{r}
+# ------------------------------------------------------------
 # KAZA
 # ------------------------------------------------------------
 pop_label <- "kaza"
@@ -426,6 +465,7 @@ plot(res_west_dry$mean_lp, main = "West Dry Resistance (mean LP)")
 plet(res_west_wet$mean_lp, col = rev(terrain.colors(100)), tiles = "OpenStreetMap")
 plet(res_west_dry$mean_lp, col = rev(terrain.colors(100)), tiles = "OpenStreetMap")
 ```
+
 
 
 
