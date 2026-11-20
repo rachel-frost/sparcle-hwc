@@ -458,8 +458,8 @@ res_west_wet <- run_resistance_all_years(ssf_results[["west_wet"]], "wet", pop_l
 res_west_dry <- run_resistance_all_years(ssf_results[["west_dry"]], "dry", pop_label, valid_area_west, common_clip = TRUE)
 
 # Visualize
-plot(res_west_wet$by_year[[c("2010", "2015", "2020")]])
-plot(res_west_dry$by_year[[c("2010", "2015", "2020")]])
+plot(res_west_wet$by_year[[c("2008", "2020")]])
+plot(res_west_dry$by_year[[c("2008", "2020")]])
 plot(res_west_wet$mean_lp, main = "West Wet Resistance (mean LP)")
 plot(res_west_dry$mean_lp, main = "West Dry Resistance (mean LP)")
 plet(res_west_wet$mean_lp, col = rev(terrain.colors(100)), tiles = "OpenStreetMap")
